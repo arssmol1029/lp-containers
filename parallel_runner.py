@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -23,6 +24,28 @@ FORCED_OPTIONS = (
     ("log_to_console", "true"),
     ("threads", "1"),
     ("parallel", "off"),
+)
+LP_CONSTRAINT_SECTIONS = {"subject to", "such that", "st", "s.t."}
+LP_END_SECTIONS = {
+    "bounds",
+    "bound",
+    "binary",
+    "binaries",
+    "bin",
+    "general",
+    "generals",
+    "gen",
+    "integer",
+    "integers",
+    "semi-continuous",
+    "semi",
+    "semis",
+    "sos",
+    "end",
+}
+LP_CONSTRAINT_NAME_RE = re.compile(r"[ \t]*([^\s:]+)[ \t]*:")
+LP_COMPARISON_RE = re.compile(
+    r"<=|>=|(?<![<>])=(?!=)|(?<!<)<(?!=)|(?<!>)>(?!=)"
 )
 
 
@@ -60,6 +83,19 @@ class PreparedWorker:
     work_dir: Path
     model_path: Path
     options_path: Path
+
+
+@dataclass(frozen=True)
+class MpsLayout:
+    lines: tuple[str, ...]
+    constraint_positions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class LpLayout:
+    prefix: tuple[str, ...]
+    constraint_blocks: tuple[tuple[str, ...], ...]
+    suffix: tuple[str, ...]
 
 
 def build_parser() -> RunnerArgumentParser:
@@ -254,7 +290,144 @@ def make_effective_options(source: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def read_model(path: Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as model_file:
+            return model_file.read()
+    except (OSError, UnicodeError) as error:
+        raise InputError(f"не удалось прочитать модель {path}: {error}") from error
+
+
+def normalize_lp_section(line: str) -> str:
+    return " ".join(line.strip().lower().split())
+
+
+def parse_mps_layout(source: str) -> MpsLayout:
+    lines = tuple(source.splitlines(keepends=True))
+    rows_headers = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip().upper() == "ROWS"
+    ]
+    if len(rows_headers) != 1:
+        raise InputError("MPS должен содержать ровно одну секцию ROWS")
+
+    rows_start = rows_headers[0]
+    columns_headers = [
+        index
+        for index in range(rows_start + 1, len(lines))
+        if lines[index].strip().upper() == "COLUMNS"
+    ]
+    if not columns_headers:
+        raise InputError("после секции ROWS в MPS не найдена секция COLUMNS")
+    rows_end = columns_headers[0]
+
+    constraint_positions: list[int] = []
+    row_names: set[str] = set()
+    for index in range(rows_start + 1, rows_end):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("*"):
+            continue
+        fields = stripped.split()
+        if len(fields) != 2 or fields[0].upper() not in {"N", "E", "L", "G"}:
+            raise InputError(
+                f"неоднозначная строка {index + 1} секции ROWS в MPS"
+            )
+        row_type = fields[0].upper()
+        row_name = fields[1]
+        if row_name in row_names:
+            raise InputError(
+                f"повторяющееся имя строки {row_name!r} в секции ROWS"
+            )
+        row_names.add(row_name)
+        if row_type in {"E", "L", "G"}:
+            constraint_positions.append(index)
+
+    return MpsLayout(lines, tuple(constraint_positions))
+
+
+def render_mps(layout: MpsLayout, seed: int) -> str:
+    result = list(layout.lines)
+    shuffled = [layout.lines[index] for index in layout.constraint_positions]
+    random.Random(seed).shuffle(shuffled)
+    for index, line in zip(layout.constraint_positions, shuffled):
+        result[index] = line
+    return "".join(result)
+
+
+def parse_lp_layout(source: str) -> LpLayout:
+    lines = tuple(source.splitlines(keepends=True))
+    masked_lines = tuple(line.split("\\", maxsplit=1)[0] for line in lines)
+
+    section_headers = [
+        index
+        for index, line in enumerate(masked_lines)
+        if normalize_lp_section(line) in LP_CONSTRAINT_SECTIONS
+    ]
+    if len(section_headers) != 1:
+        raise InputError("LP должен содержать ровно одну секцию Subject To")
+
+    section_start = section_headers[0]
+    section_end = len(lines)
+    for index in range(section_start + 1, len(masked_lines)):
+        if normalize_lp_section(masked_lines[index]) in LP_END_SECTIONS:
+            section_end = index
+            break
+
+    block_starts: list[int] = []
+    block_names: list[str] = []
+    for index in range(section_start + 1, section_end):
+        match = LP_CONSTRAINT_NAME_RE.match(masked_lines[index])
+        if match is not None:
+            block_starts.append(index)
+            block_names.append(match.group(1))
+
+    if not block_starts:
+        raise InputError("секция Subject To не содержит именованных ограничений")
+    if len(block_names) != len(set(block_names)):
+        raise InputError("имена ограничений LP должны быть уникальными")
+
+    preamble = "".join(masked_lines[section_start + 1 : block_starts[0]])
+    if preamble.strip():
+        raise InputError("обнаружено безымянное ограничение в начале Subject To")
+
+    blocks: list[tuple[str, ...]] = []
+    for block_number, start in enumerate(block_starts):
+        end = (
+            block_starts[block_number + 1]
+            if block_number + 1 < len(block_starts)
+            else section_end
+        )
+        masked_block = "".join(masked_lines[start:end])
+        comparisons = LP_COMPARISON_RE.findall(masked_block)
+        if len(comparisons) != 1:
+            raise InputError(
+                f"ограничение {block_names[block_number]!r} неоднозначно: "
+                f"ожидался один оператор сравнения, найдено {len(comparisons)}"
+            )
+        blocks.append(lines[start:end])
+
+    return LpLayout(
+        prefix=lines[: block_starts[0]],
+        constraint_blocks=tuple(blocks),
+        suffix=lines[section_end:],
+    )
+
+
+def render_lp(layout: LpLayout, seed: int) -> str:
+    blocks = list(layout.constraint_blocks)
+    random.Random(seed).shuffle(blocks)
+    shuffled_lines = [line for block in blocks for line in block]
+    return "".join((*layout.prefix, *shuffled_lines, *layout.suffix))
+
+
 def prepare_workers(config: RunConfig) -> tuple[PreparedWorker, ...]:
+    model_source = read_model(config.model_path)
+    if config.model_format == "mps":
+        model_layout: MpsLayout | LpLayout = parse_mps_layout(model_source)
+    else:
+        model_layout = parse_lp_layout(model_source)
+
     effective_options = {
         worker.worker_id: make_effective_options(read_options(worker.options_path))
         for worker in config.workers
@@ -273,7 +446,16 @@ def prepare_workers(config: RunConfig) -> tuple[PreparedWorker, ...]:
             work_dir.mkdir()
             model_path = work_dir / f"model.{config.model_format}"
             options_path = work_dir / "effective.options"
-            shutil.copyfile(config.model_path, model_path)
+            if worker.order_seed is None:
+                shutil.copyfile(config.model_path, model_path)
+            elif config.model_format == "mps":
+                model_path.write_text(
+                    render_mps(model_layout, worker.order_seed), encoding="utf-8"
+                )
+            else:
+                model_path.write_text(
+                    render_lp(model_layout, worker.order_seed), encoding="utf-8"
+                )
             options_path.write_text(
                 effective_options[worker.worker_id], encoding="utf-8"
             )
