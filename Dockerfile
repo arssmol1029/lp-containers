@@ -1,6 +1,7 @@
 FROM debian:bookworm-slim AS builder
 
 ARG HIGHS_VERSION=1.15.1
+ARG HIGHS_BUILD_JOBS=4
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -27,7 +28,7 @@ RUN curl -fsSL \
         -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_TESTING=OFF \
         -DBUILD_EXAMPLES=OFF \
-    && cmake --build cmake-build --parallel \
+    && cmake --build cmake-build --parallel "${HIGHS_BUILD_JOBS}" \
     && cmake --install cmake-build \
     && /opt/highs/bin/highs --version
 

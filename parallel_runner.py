@@ -661,9 +661,6 @@ def normalize_highs_status(value: str) -> str:
 def parse_highs_output(
     stdout: str, stderr: str, exit_code: int
 ) -> tuple[str, str | None, float | None]:
-    if exit_code != 0:
-        return "ERROR", None, None
-
     output = stdout + "\n" + stderr
     statuses = [
         (match.start(), match.group(1))
@@ -671,9 +668,12 @@ def parse_highs_output(
         for match in pattern.finditer(output)
     ]
     if not statuses:
-        return "UNKNOWN", None, None
+        status = "ERROR" if exit_code != 0 else "UNKNOWN"
+        return status, None, None
     _, raw_status = max(statuses, key=lambda item: item[0])
     status = normalize_highs_status(raw_status)
+    if exit_code != 0 and status in WINNING_STATUSES:
+        return "ERROR", None, None
     if status != "OPTIMAL":
         return status, None, None
 
