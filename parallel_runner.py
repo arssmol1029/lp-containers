@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
+import queue
 import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 
+EXIT_OK = 0
+EXIT_NO_RESULT = 2
+EXIT_CONFLICT = 3
 EXIT_INPUT_ERROR = 64
+EXIT_INTERRUPTED = 130
 WORKER_COLUMNS = ["id", "solver", "options", "order_seed"]
 WORKER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 SEED_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
@@ -47,6 +56,19 @@ LP_CONSTRAINT_NAME_RE = re.compile(r"[ \t]*([^\s:]+)[ \t]*:")
 LP_COMPARISON_RE = re.compile(
     r"<=|>=|(?<![<>])=(?!=)|(?<!<)<(?!=)|(?<!>)>(?!=)"
 )
+HIGHS_MODEL_STATUS_RE = re.compile(
+    r"^\s*Model status\s*:\s*(.*?)\s*$", re.MULTILINE
+)
+HIGHS_REPORT_STATUS_RE = re.compile(
+    r"^\s*Status\s+(.*?)\s*$", re.MULTILINE
+)
+HIGHS_OBJECTIVE_RE = re.compile(
+    r"^\s*Objective value\s*:\s*(\S+)", re.MULTILINE
+)
+HIGHS_PRIMAL_BOUND_RE = re.compile(
+    r"^\s*Primal bound\s+(\S+)", re.MULTILINE
+)
+WINNING_STATUSES = {"OPTIMAL", "INFEASIBLE", "UNBOUNDED"}
 
 
 class InputError(Exception):
@@ -96,6 +118,30 @@ class LpLayout:
     prefix: tuple[str, ...]
     constraint_blocks: tuple[tuple[str, ...], ...]
     suffix: tuple[str, ...]
+
+
+@dataclass
+class WorkerState:
+    prepared: PreparedWorker
+    container_name: str
+    stdout_path: Path
+    stderr_path: Path
+    started_at: float | None = None
+    process: subprocess.Popen[bytes] | None = None
+    cancelled: bool = False
+    result: WorkerResult | None = None
+
+
+@dataclass(frozen=True)
+class WorkerResult:
+    worker_id: str
+    solver: str
+    order_seed: int | None
+    status: str
+    objective: str | None
+    objective_value: float | None
+    elapsed_seconds: float
+    exit_code: int | None
 
 
 def build_parser() -> RunnerArgumentParser:
@@ -470,6 +516,458 @@ def prepare_workers(config: RunConfig) -> tuple[PreparedWorker, ...]:
     return tuple(prepared)
 
 
+def solver_arguments(worker: PreparedWorker) -> list[str]:
+    if worker.spec.solver == "highs":
+        return [
+            "--model_file",
+            f"/work/{worker.model_path.name}",
+            "--options_file",
+            f"/work/{worker.options_path.name}",
+        ]
+    raise InputError(f"неизвестный solver: {worker.spec.solver}")
+
+
+def build_container_command(
+    config: RunConfig, state: WorkerState
+) -> list[str]:
+    return [
+        config.docker_path,
+        "run",
+        "--name",
+        state.container_name,
+        "--network",
+        "none",
+        "--volume",
+        f"{state.prepared.work_dir}:/work:ro",
+        "--workdir",
+        "/tmp",
+        config.image,
+        *solver_arguments(state.prepared),
+    ]
+
+
+def make_worker_states(
+    prepared: tuple[PreparedWorker, ...],
+) -> list[WorkerState]:
+    run_token = uuid.uuid4().hex[:12]
+    return [
+        WorkerState(
+            prepared=worker,
+            container_name=(
+                f"lp-containers-{os.getpid()}-{run_token}-{worker.spec.worker_id}"
+            ),
+            stdout_path=worker.work_dir / "stdout.log",
+            stderr_path=worker.work_dir / "stderr.log",
+        )
+        for worker in prepared
+    ]
+
+
+def error_result(state: WorkerState, message: str) -> WorkerResult:
+    try:
+        state.stderr_path.write_text(message + "\n", encoding="utf-8")
+        state.stdout_path.touch()
+    except OSError:
+        pass
+    return WorkerResult(
+        worker_id=state.prepared.spec.worker_id,
+        solver=state.prepared.spec.solver,
+        order_seed=state.prepared.spec.order_seed,
+        status="ERROR",
+        objective=None,
+        objective_value=None,
+        elapsed_seconds=0.0,
+        exit_code=None,
+    )
+
+
+def launch_workers(config: RunConfig, states: list[WorkerState]) -> None:
+    for state in states:
+        try:
+            stdout_file = state.stdout_path.open("wb")
+            stderr_file = state.stderr_path.open("wb")
+        except OSError as error:
+            state.result = error_result(
+                state, f"Не удалось открыть файлы вывода: {error}"
+            )
+            continue
+
+        state.started_at = time.monotonic()
+        try:
+            state.process = subprocess.Popen(
+                build_container_command(config, state),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
+        except OSError as error:
+            state.result = error_result(
+                state, f"Не удалось запустить docker run: {error}"
+            )
+        finally:
+            stdout_file.close()
+            stderr_file.close()
+
+
+def wait_for_worker(
+    state: WorkerState,
+    completions: queue.Queue[tuple[WorkerState, int, float]],
+) -> None:
+    if state.process is None:
+        return
+    exit_code = state.process.wait()
+    completions.put((state, exit_code, time.monotonic()))
+
+
+def start_waiters(
+    states: list[WorkerState],
+    completions: queue.Queue[tuple[WorkerState, int, float]],
+) -> list[threading.Thread]:
+    threads: list[threading.Thread] = []
+    for state in states:
+        if state.process is None:
+            continue
+        thread = threading.Thread(
+            target=wait_for_worker,
+            args=(state, completions),
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+    return threads
+
+
+def read_log(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def normalize_highs_status(value: str) -> str:
+    normalized = re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_")
+    if normalized in {
+        "UNBOUNDED_OR_INFEASIBLE",
+        "INFEASIBLE_OR_UNBOUNDED",
+    }:
+        return "UNBOUNDED_OR_INFEASIBLE"
+    if normalized.startswith("TIME_LIMIT"):
+        return "TIMEOUT"
+    if "ERROR" in normalized:
+        return "ERROR"
+    return normalized or "UNKNOWN"
+
+
+def parse_highs_output(
+    stdout: str, stderr: str, exit_code: int
+) -> tuple[str, str | None, float | None]:
+    if exit_code != 0:
+        return "ERROR", None, None
+
+    output = stdout + "\n" + stderr
+    statuses = [
+        (match.start(), match.group(1))
+        for pattern in (HIGHS_MODEL_STATUS_RE, HIGHS_REPORT_STATUS_RE)
+        for match in pattern.finditer(output)
+    ]
+    if not statuses:
+        return "UNKNOWN", None, None
+    _, raw_status = max(statuses, key=lambda item: item[0])
+    status = normalize_highs_status(raw_status)
+    if status != "OPTIMAL":
+        return status, None, None
+
+    objectives = [
+        (match.start(), match.group(1))
+        for pattern in (HIGHS_OBJECTIVE_RE, HIGHS_PRIMAL_BOUND_RE)
+        for match in pattern.finditer(output)
+    ]
+    if not objectives:
+        return status, None, None
+
+    _, objective = max(objectives, key=lambda item: item[0])
+    try:
+        objective_value = float(objective)
+    except ValueError:
+        objective_value = None
+    return status, objective, objective_value
+
+
+def parse_solver_output(
+    solver: str, stdout: str, stderr: str, exit_code: int
+) -> tuple[str, str | None, float | None]:
+    if solver == "highs":
+        return parse_highs_output(stdout, stderr, exit_code)
+    return "ERROR", None, None
+
+
+def completed_result(
+    state: WorkerState, exit_code: int, finished_at: float
+) -> WorkerResult:
+    started_at = state.started_at if state.started_at is not None else finished_at
+    elapsed = max(0.0, finished_at - started_at)
+    if state.cancelled:
+        status = "CANCELLED"
+        objective = None
+        objective_value = None
+    else:
+        status, objective, objective_value = parse_solver_output(
+            state.prepared.spec.solver,
+            read_log(state.stdout_path),
+            read_log(state.stderr_path),
+            exit_code,
+        )
+    return WorkerResult(
+        worker_id=state.prepared.spec.worker_id,
+        solver=state.prepared.spec.solver,
+        order_seed=state.prepared.spec.order_seed,
+        status=status,
+        objective=objective,
+        objective_value=objective_value,
+        elapsed_seconds=elapsed,
+        exit_code=exit_code,
+    )
+
+
+def remove_containers(
+    config: RunConfig, container_names: list[str]
+) -> None:
+    if not container_names:
+        return
+    try:
+        subprocess.run(
+            [config.docker_path, "rm", "-f", *container_names],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def stop_running_workers(config: RunConfig, states: list[WorkerState]) -> None:
+    targets = [
+        state
+        for state in states
+        if state.process is not None and state.process.poll() is None
+    ]
+    for state in targets:
+        state.cancelled = True
+
+    stop_processes: list[subprocess.Popen[bytes]] = []
+    for state in targets:
+        try:
+            stop_processes.append(
+                subprocess.Popen(
+                    [
+                        config.docker_path,
+                        "stop",
+                        "--time",
+                        "2",
+                        state.container_name,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        except OSError:
+            pass
+
+    for process in stop_processes:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    remove_containers(
+        config, [state.container_name for state in targets]
+    )
+
+
+def monitor_workers(
+    config: RunConfig,
+    states: list[WorkerState],
+    completions: queue.Queue[tuple[WorkerState, int, float]],
+) -> WorkerResult | None:
+    remaining = sum(state.process is not None for state in states)
+    winner: WorkerResult | None = None
+    while remaining:
+        state, exit_code, finished_at = completions.get()
+        remaining -= 1
+        state.result = completed_result(state, exit_code, finished_at)
+        if winner is None and state.result.status in WINNING_STATUSES:
+            winner = state.result
+            stop_running_workers(config, states)
+    return winner
+
+
+def finish_after_interrupt(config: RunConfig, states: list[WorkerState]) -> None:
+    stop_running_workers(config, states)
+    remove_containers(
+        config,
+        [state.container_name for state in states if state.process is not None],
+    )
+
+    for state in states:
+        if state.result is not None:
+            continue
+        if state.process is None:
+            state.result = WorkerResult(
+                worker_id=state.prepared.spec.worker_id,
+                solver=state.prepared.spec.solver,
+                order_seed=state.prepared.spec.order_seed,
+                status="CANCELLED",
+                objective=None,
+                objective_value=None,
+                elapsed_seconds=0.0,
+                exit_code=None,
+            )
+            continue
+
+        try:
+            exit_code = state.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            state.process.kill()
+            exit_code = state.process.wait()
+        state.result = completed_result(state, exit_code, time.monotonic())
+
+
+def results_conflict(results: list[WorkerResult]) -> bool:
+    proven = [result for result in results if result.status in WINNING_STATUSES]
+    if len(proven) < 2:
+        return False
+
+    reference = proven[0]
+    for result in proven[1:]:
+        if result.status != reference.status:
+            return True
+        if (
+            result.status == "OPTIMAL"
+            and reference.objective_value is not None
+            and result.objective_value is not None
+            and not math.isclose(
+                reference.objective_value,
+                result.objective_value,
+                rel_tol=1e-7,
+                abs_tol=1e-9,
+            )
+        ):
+            return True
+    return False
+
+
+def seed_text(seed: int | None) -> str:
+    return "original" if seed is None else str(seed)
+
+
+def write_reports(
+    config: RunConfig,
+    results: list[WorkerResult],
+    winner: WorkerResult | None,
+) -> None:
+    workers_path = config.output_dir / "workers.tsv"
+    with workers_path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+        writer.writerow(
+            [
+                "id",
+                "solver",
+                "order_seed",
+                "status",
+                "objective",
+                "elapsed_seconds",
+                "exit_code",
+            ]
+        )
+        for result in results:
+            writer.writerow(
+                [
+                    result.worker_id,
+                    result.solver,
+                    seed_text(result.order_seed),
+                    result.status,
+                    result.objective or "",
+                    f"{result.elapsed_seconds:.6f}",
+                    "" if result.exit_code is None else result.exit_code,
+                ]
+            )
+
+    winner_path = config.output_dir / "winner.tsv"
+    with winner_path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+        writer.writerow(
+            ["id", "solver", "status", "objective", "elapsed_seconds"]
+        )
+        if winner is not None:
+            writer.writerow(
+                [
+                    winner.worker_id,
+                    winner.solver,
+                    winner.status,
+                    winner.objective or "",
+                    f"{winner.elapsed_seconds:.6f}",
+                ]
+            )
+
+
+def execute_workers(
+    config: RunConfig, prepared: tuple[PreparedWorker, ...]
+) -> int:
+    states = make_worker_states(prepared)
+    completions: queue.Queue[tuple[WorkerState, int, float]] = queue.Queue()
+    waiters: list[threading.Thread] = []
+    winner: WorkerResult | None = None
+    interrupted = False
+
+    try:
+        launch_workers(config, states)
+        waiters = start_waiters(states, completions)
+        winner = monitor_workers(config, states, completions)
+    except KeyboardInterrupt:
+        interrupted = True
+        finish_after_interrupt(config, states)
+    finally:
+        remove_containers(
+            config,
+            [state.container_name for state in states if state.process is not None],
+        )
+        for thread in waiters:
+            thread.join(timeout=1)
+
+    for state in states:
+        if state.result is None:
+            state.result = error_result(state, "Worker не вернул результат")
+    results = [state.result for state in states if state.result is not None]
+
+    conflict = False if interrupted else results_conflict(results)
+    report_winner = None if interrupted or conflict else winner
+    try:
+        write_reports(config, results, report_winner)
+    except OSError as error:
+        print(f"Не удалось записать итоговые TSV: {error}", file=sys.stderr)
+        return EXIT_INTERRUPTED if interrupted else EXIT_NO_RESULT
+
+    if interrupted:
+        print("Запуск прерван", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    if conflict:
+        print("Обнаружен конфликт результатов решателей", file=sys.stderr)
+        return EXIT_CONFLICT
+    if winner is None:
+        print("Доказанный конечный результат не получен", file=sys.stderr)
+        return EXIT_NO_RESULT
+
+    print(
+        f"Победитель: {winner.worker_id}, статус: {winner.status}, "
+        f"время: {winner.elapsed_seconds:.6f} с"
+    )
+    return EXIT_OK
+
+
 def run(arguments: Sequence[str] | None = None) -> int:
     try:
         parsed = build_parser().parse_args(arguments)
@@ -479,9 +977,7 @@ def run(arguments: Sequence[str] | None = None) -> int:
         print(f"Ошибка входных данных: {error}", file=sys.stderr)
         return EXIT_INPUT_ERROR
 
-    print(f"Подготовлено worker'ов: {len(prepared)}")
-    print(f"Выходной каталог: {config.output_dir}")
-    return 0
+    return execute_workers(config, prepared)
 
 
 if __name__ == "__main__":
