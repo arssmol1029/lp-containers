@@ -98,6 +98,7 @@ class RunConfig:
     output_dir: Path
     docker_path: str
     workers: tuple[WorkerSpec, ...]
+    wait_all: bool
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,11 @@ def build_parser() -> RunnerArgumentParser:
     parser.add_argument("--workers", required=True, type=Path)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--wait-all",
+        action="store_true",
+        help="не останавливать остальные контейнеры после первого результата",
+    )
     return parser
 
 
@@ -307,6 +313,7 @@ def load_config(arguments: argparse.Namespace) -> RunConfig:
         output_dir=output_dir,
         docker_path=docker_path,
         workers=workers,
+        wait_all=arguments.wait_all,
     )
 
 
@@ -814,7 +821,8 @@ def monitor_workers(
         state.result = completed_result(state, exit_code, finished_at)
         if winner is None and state.result.status in WINNING_STATUSES:
             winner = state.result
-            stop_running_workers(config, states)
+            if not config.wait_all:
+                stop_running_workers(config, states)
     return winner
 
 
