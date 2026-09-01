@@ -68,6 +68,7 @@ HIGHS_OBJECTIVE_RE = re.compile(
 HIGHS_PRIMAL_BOUND_RE = re.compile(
     r"^\s*Primal bound\s+(\S+)", re.MULTILINE
 )
+HIGHS_TIMING_RE = re.compile(r"^\s*Timing\s+(\S+)\s*$", re.MULTILINE)
 WINNING_STATUSES = {"OPTIMAL", "INFEASIBLE", "UNBOUNDED"}
 
 
@@ -140,7 +141,8 @@ class WorkerResult:
     status: str
     objective: str | None
     objective_value: float | None
-    elapsed_seconds: float
+    solver_seconds: float | None
+    container_seconds: float
     exit_code: int | None
 
 
@@ -576,7 +578,8 @@ def error_result(state: WorkerState, message: str) -> WorkerResult:
         status="ERROR",
         objective=None,
         objective_value=None,
-        elapsed_seconds=0.0,
+        solver_seconds=None,
+        container_seconds=0.0,
         exit_code=None,
     )
 
@@ -660,8 +663,16 @@ def normalize_highs_status(value: str) -> str:
 
 def parse_highs_output(
     stdout: str, stderr: str, exit_code: int
-) -> tuple[str, str | None, float | None]:
+) -> tuple[str, str | None, float | None, float | None]:
     output = stdout + "\n" + stderr
+    timing_matches = list(HIGHS_TIMING_RE.finditer(output))
+    solver_seconds = None
+    if timing_matches:
+        try:
+            solver_seconds = float(timing_matches[-1].group(1))
+        except ValueError:
+            pass
+
     statuses = [
         (match.start(), match.group(1))
         for pattern in (HIGHS_MODEL_STATUS_RE, HIGHS_REPORT_STATUS_RE)
@@ -669,13 +680,13 @@ def parse_highs_output(
     ]
     if not statuses:
         status = "ERROR" if exit_code != 0 else "UNKNOWN"
-        return status, None, None
+        return status, None, None, solver_seconds
     _, raw_status = max(statuses, key=lambda item: item[0])
     status = normalize_highs_status(raw_status)
     if exit_code != 0 and status in WINNING_STATUSES:
-        return "ERROR", None, None
+        return "ERROR", None, None, solver_seconds
     if status != "OPTIMAL":
-        return status, None, None
+        return status, None, None, solver_seconds
 
     objectives = [
         (match.start(), match.group(1))
@@ -683,35 +694,36 @@ def parse_highs_output(
         for match in pattern.finditer(output)
     ]
     if not objectives:
-        return status, None, None
+        return status, None, None, solver_seconds
 
     _, objective = max(objectives, key=lambda item: item[0])
     try:
         objective_value = float(objective)
     except ValueError:
         objective_value = None
-    return status, objective, objective_value
+    return status, objective, objective_value, solver_seconds
 
 
 def parse_solver_output(
     solver: str, stdout: str, stderr: str, exit_code: int
-) -> tuple[str, str | None, float | None]:
+) -> tuple[str, str | None, float | None, float | None]:
     if solver == "highs":
         return parse_highs_output(stdout, stderr, exit_code)
-    return "ERROR", None, None
+    return "ERROR", None, None, None
 
 
 def completed_result(
     state: WorkerState, exit_code: int, finished_at: float
 ) -> WorkerResult:
     started_at = state.started_at if state.started_at is not None else finished_at
-    elapsed = max(0.0, finished_at - started_at)
+    container_seconds = max(0.0, finished_at - started_at)
     if state.cancelled:
         status = "CANCELLED"
         objective = None
         objective_value = None
+        solver_seconds = None
     else:
-        status, objective, objective_value = parse_solver_output(
+        status, objective, objective_value, solver_seconds = parse_solver_output(
             state.prepared.spec.solver,
             read_log(state.stdout_path),
             read_log(state.stderr_path),
@@ -724,7 +736,8 @@ def completed_result(
         status=status,
         objective=objective,
         objective_value=objective_value,
-        elapsed_seconds=elapsed,
+        solver_seconds=solver_seconds,
+        container_seconds=container_seconds,
         exit_code=exit_code,
     )
 
@@ -823,7 +836,8 @@ def finish_after_interrupt(config: RunConfig, states: list[WorkerState]) -> None
                 status="CANCELLED",
                 objective=None,
                 objective_value=None,
-                elapsed_seconds=0.0,
+                solver_seconds=None,
+                container_seconds=0.0,
                 exit_code=None,
             )
             continue
@@ -879,7 +893,8 @@ def write_reports(
                 "order_seed",
                 "status",
                 "objective",
-                "elapsed_seconds",
+                "solver_seconds",
+                "container_seconds",
                 "exit_code",
             ]
         )
@@ -891,7 +906,12 @@ def write_reports(
                     seed_text(result.order_seed),
                     result.status,
                     result.objective or "",
-                    f"{result.elapsed_seconds:.6f}",
+                    (
+                        ""
+                        if result.solver_seconds is None
+                        else f"{result.solver_seconds:.6f}"
+                    ),
+                    f"{result.container_seconds:.6f}",
                     "" if result.exit_code is None else result.exit_code,
                 ]
             )
@@ -900,7 +920,14 @@ def write_reports(
     with winner_path.open("w", encoding="utf-8", newline="") as output:
         writer = csv.writer(output, delimiter="\t", lineterminator="\n")
         writer.writerow(
-            ["id", "solver", "status", "objective", "elapsed_seconds"]
+            [
+                "id",
+                "solver",
+                "status",
+                "objective",
+                "solver_seconds",
+                "container_seconds",
+            ]
         )
         if winner is not None:
             writer.writerow(
@@ -909,7 +936,12 @@ def write_reports(
                     winner.solver,
                     winner.status,
                     winner.objective or "",
-                    f"{winner.elapsed_seconds:.6f}",
+                    (
+                        ""
+                        if winner.solver_seconds is None
+                        else f"{winner.solver_seconds:.6f}"
+                    ),
+                    f"{winner.container_seconds:.6f}",
                 ]
             )
 
@@ -961,9 +993,15 @@ def execute_workers(
         print("Доказанный конечный результат не получен", file=sys.stderr)
         return EXIT_NO_RESULT
 
+    solver_time = (
+        "недоступно"
+        if winner.solver_seconds is None
+        else f"{winner.solver_seconds:.6f} с"
+    )
     print(
         f"Победитель: {winner.worker_id}, статус: {winner.status}, "
-        f"время: {winner.elapsed_seconds:.6f} с"
+        f"время решателя: {solver_time}, "
+        f"время контейнера: {winner.container_seconds:.6f} с"
     )
     return EXIT_OK
 
