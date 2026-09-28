@@ -1,0 +1,41 @@
+FROM debian:bookworm-slim AS builder
+
+ARG LPSOLVE_VERSION=5.5.2.14
+ARG LPSOLVE_SHA256=a4bbdc881128bdbe920a38e134c9add5db47f9aa814a0a018ba940b0f3c278c3
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+RUN curl -fsSL \
+        "https://github.com/lp-solve/lp_solve/releases/download/${LPSOLVE_VERSION}/lp_solve_${LPSOLVE_VERSION}_source.tar.gz" \
+        -o lp_solve.tar.gz \
+    && printf '%s  %s\n' "${LPSOLVE_SHA256}" lp_solve.tar.gz | sha256sum -c - \
+    && mkdir source \
+    && tar -xzf lp_solve.tar.gz --strip-components=1 -C source \
+    && cd source/lpsolve55 \
+    && sh ccc \
+    && cd ../lp_solve \
+    && sh ccc \
+    && bin/ux64/lp_solve -h >/dev/null
+
+FROM debian:bookworm-slim AS runtime
+
+ARG LPSOLVE_VERSION=5.5.2.14
+
+LABEL org.opencontainers.image.title="lp_solve"
+LABEL org.opencontainers.image.version="${LPSOLVE_VERSION}"
+LABEL org.opencontainers.image.source="https://github.com/lp-solve/lp_solve"
+
+COPY --from=builder /build/source/lp_solve/bin/ux64/lp_solve /usr/local/bin/lp_solve
+
+RUN lp_solve -h >/dev/null
+
+WORKDIR /work
+
+ENTRYPOINT ["lp_solve"]

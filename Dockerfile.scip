@@ -1,0 +1,56 @@
+FROM debian:bookworm-slim AS download
+
+ARG SCIP_VERSION=10.1.0
+ARG TARGETARCH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /download
+
+RUN architecture="${TARGETARCH:-$(dpkg --print-architecture)}" \
+    && case "${architecture}" in \
+        amd64) \
+            archive="scipoptsuite-${SCIP_VERSION}-glibc2_28-amd64.tgz"; \
+            checksum="330a884428af4d644370cdf36ba405b879a9e17341c5ad2646917ba8972767eb" \
+            ;; \
+        arm64) \
+            archive="scipoptsuite-${SCIP_VERSION}-glibc2_28-aarch64.tgz"; \
+            checksum="bd99d8cfb146c8e33e2b40eccbaac914d9f048e84169cbaa9a1ce063bc46c3e7" \
+            ;; \
+        *) \
+            printf 'unsupported architecture: %s\n' "${architecture}" >&2; \
+            exit 64 \
+            ;; \
+    esac \
+    && curl -fsSL \
+        "https://github.com/scipopt/scip/releases/download/v${SCIP_VERSION}/${archive}" \
+        -o scipoptsuite.tgz \
+    && printf '%s  %s\n' "${checksum}" scipoptsuite.tgz | sha256sum -c - \
+    && mkdir /opt/scip \
+    && tar -xzf scipoptsuite.tgz --strip-components=1 -C /opt/scip
+
+FROM debian:bookworm-slim AS runtime
+
+ARG SCIP_VERSION=10.1.0
+
+LABEL org.opencontainers.image.title="SCIP Optimization Suite"
+LABEL org.opencontainers.image.version="${SCIP_VERSION}"
+LABEL org.opencontainers.image.source="https://github.com/scipopt/scip"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 libstdc++6 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=download /opt/scip /opt/scip
+
+ENV PATH="/opt/scip/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/scip/lib"
+
+RUN scip --version \
+    && fscip /dev/null /dev/null -sth 2 | grep -F "parallelized by UG"
+
+WORKDIR /work
+
+ENTRYPOINT ["scip"]

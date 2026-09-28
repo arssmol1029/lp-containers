@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run independent HiGHS jobs on a pool of already-running containers."""
+"""Run independent solver jobs on a pool of already-running containers."""
 
 from __future__ import annotations
 
@@ -28,10 +28,11 @@ EXIT_CONFLICT = 3
 EXIT_INPUT_ERROR = 64
 EXIT_INTERRUPTED = 130
 
-CONTAINER_COLUMNS = ["id", "container_name"]
+CONTAINER_COLUMNS = ["id", "container_name", "solver", "threads"]
 JOB_COLUMNS = [
     "problem_id",
     "job_id",
+    "solver",
     "model",
     "options",
     "order",
@@ -42,12 +43,29 @@ CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 UINT64_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 MAX_UINT64 = (1 << 64) - 1
 WINNING_STATUSES = {"OPTIMAL", "INFEASIBLE", "UNBOUNDED"}
-FORCED_OPTIONS = (
+HIGHS_FORCED_OPTIONS = (
     ("output_flag", "true"),
     ("log_to_console", "true"),
     ("threads", "1"),
     ("parallel", "off"),
 )
+SCIP_FORCED_OPTIONS = (("lp/threads", "1"),)
+FSCIP_SCIP_OPTIONS = "# Задано parallel_runner.py\nlp/threads = 1\n"
+
+
+@dataclass(frozen=True)
+class SolverDefinition:
+    executable: str
+    options_suffix: str
+    model_formats: frozenset[str]
+
+
+SOLVERS = {
+    "highs": SolverDefinition("highs", ".options", frozenset({"lp", "mps"})),
+    "scip": SolverDefinition("scip", ".set", frozenset({"lp", "mps"})),
+    "fscip": SolverDefinition("fscip", ".prm", frozenset({"lp", "mps"})),
+    "lp_solve": SolverDefinition("lp_solve", ".ini", frozenset({"mps"})),
+}
 
 LP_CONSTRAINT_SECTIONS = {"subject to", "such that", "st", "s.t."}
 LP_END_SECTIONS = {
@@ -88,6 +106,33 @@ HIGHS_TIMING_RE = re.compile(
     r"^\s*(?:Timing|(?:HiGHS\s+)?Run Time)\s+(?::\s*)?(\S+)",
     re.MULTILINE | re.IGNORECASE,
 )
+SCIP_STATUS_RE = re.compile(
+    r"^\s*SCIP Status\s*:\s*(.*?)\s*$", re.MULTILINE | re.IGNORECASE
+)
+SCIP_PRIMAL_BOUND_RE = re.compile(
+    r"^\s*Primal Bound\s*:\s*(\S+)", re.MULTILINE | re.IGNORECASE
+)
+SCIP_DUAL_BOUND_RE = re.compile(
+    r"^\s*Dual Bound\s*:\s*(\S+)", re.MULTILINE | re.IGNORECASE
+)
+SCIP_OBJECTIVE_RE = re.compile(
+    r"^\s*objective value\s*:\s*(\S+)", re.MULTILINE | re.IGNORECASE
+)
+SCIP_GAP_RE = re.compile(
+    r"^\s*Gap\s*:\s*(\S+)", re.MULTILINE | re.IGNORECASE
+)
+SCIP_TIMING_RE = re.compile(
+    r"^\s*(?:Solving Time \(sec\)|Total Time)\s*:\s*(\S+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+LPSOLVE_OBJECTIVE_RE = re.compile(
+    r"^\s*Value of objective function\s*:\s*(\S+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+LPSOLVE_TIMING_RE = re.compile(
+    r"^\s*CPU Time for solving\s*:\s*(\S+?)s(?:\s|$)",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 class InputError(Exception):
@@ -107,6 +152,8 @@ class RunnerArgumentParser(argparse.ArgumentParser):
 class ContainerSpec:
     container_id: str
     container_name: str
+    solver: str
+    threads: int
 
 
 @dataclass(frozen=True)
@@ -128,7 +175,7 @@ class JobSpec:
     order: OrderSpec
     timeout_seconds: float
     model_format: str
-    solver: str = "highs"
+    solver: str
 
 
 @dataclass(frozen=True)
@@ -146,6 +193,7 @@ class PreparedContent:
     job: JobSpec
     model_bytes: bytes
     options_text: str
+    auxiliary_options: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -154,6 +202,7 @@ class PreparedJob:
     artifact_dir: Path
     model_path: Path
     options_path: Path
+    auxiliary_paths: tuple[Path, ...]
     stdout_path: Path
     stderr_path: Path
 
@@ -248,7 +297,7 @@ class RunnerBackend(Protocol):
 
 def build_parser() -> RunnerArgumentParser:
     parser = RunnerArgumentParser(
-        description="Параллельный запуск HiGHS job в готовых Docker-контейнерах"
+        description="Параллельный запуск solver job в готовых Docker-контейнерах"
     )
     parser.add_argument("--containers", required=True, type=Path)
     parser.add_argument("--jobs", required=True, type=Path)
@@ -308,6 +357,34 @@ def parse_identifier(value: str, label: str, line_number: int) -> str:
     return value
 
 
+def parse_solver(value: str, line_number: int) -> str:
+    if value not in SOLVERS:
+        allowed = ", ".join(SOLVERS)
+        raise InputError(
+            f"строка {line_number}: solver должен быть одним из: {allowed}; "
+            f"получено {value!r}"
+        )
+    return value
+
+
+def parse_threads(value: str, solver: str, line_number: int) -> int:
+    if not UINT64_RE.fullmatch(value):
+        raise InputError(f"строка {line_number}: threads должен быть целым числом > 0")
+    threads = int(value)
+    if threads == 0:
+        raise InputError(f"строка {line_number}: threads должен быть целым числом > 0")
+    if solver == "fscip":
+        if threads < 2:
+            raise InputError(
+                f"строка {line_number}: для fscip threads должен быть не меньше 2"
+            )
+    elif threads != 1:
+        raise InputError(
+            f"строка {line_number}: для solver {solver!r} threads должен быть равен 1"
+        )
+    return threads
+
+
 def load_containers(path: Path) -> tuple[ContainerSpec, ...]:
     rows = read_tsv(path, CONTAINER_COLUMNS, "containers.tsv")
     if not rows:
@@ -325,9 +402,11 @@ def load_containers(path: Path) -> tuple[ContainerSpec, ...]:
             raise InputError(f"строка {line}: повторяющийся id {container_id!r}")
         if name in names:
             raise InputError(f"строка {line}: контейнер {name!r} указан повторно")
+        solver = parse_solver(row["solver"], line)
+        threads = parse_threads(row["threads"], solver, line)
         ids.add(container_id)
         names.add(name)
-        result.append(ContainerSpec(container_id, name))
+        result.append(ContainerSpec(container_id, name, solver, threads))
     return tuple(result)
 
 
@@ -394,12 +473,25 @@ def load_jobs(path: Path) -> tuple[JobSpec, ...]:
         job_id = parse_identifier(row["job_id"], "job_id", line)
         if job_id in job_ids:
             raise InputError(f"строка {line}: повторяющийся job_id {job_id!r}")
+        solver = parse_solver(row["solver"], line)
         model_path = resolve_manifest_path(path, row["model"])
         options_path = resolve_manifest_path(path, row["options"])
         require_readable_file(model_path, f"модель в строке {line}")
         require_readable_file(options_path, f"options в строке {line}")
         order = parse_order(row["order"], line)
         timeout = parse_timeout(row["timeout_seconds"], line)
+        model_format = detect_model_format(model_path)
+        definition = SOLVERS[solver]
+        if model_format not in definition.model_formats:
+            allowed = ", ".join(f".{item}" for item in sorted(definition.model_formats))
+            raise InputError(
+                f"строка {line}: solver {solver!r} поддерживает модели только {allowed}"
+            )
+        if options_path.suffix.lower() != definition.options_suffix:
+            raise InputError(
+                f"строка {line}: options для solver {solver!r} должен иметь "
+                f"расширение {definition.options_suffix}"
+            )
         result.append(
             JobSpec(
                 input_index=input_index,
@@ -409,7 +501,8 @@ def load_jobs(path: Path) -> tuple[JobSpec, ...]:
                 options_path=options_path,
                 order=order,
                 timeout_seconds=timeout,
-                model_format=detect_model_format(model_path),
+                model_format=model_format,
+                solver=solver,
             )
         )
         job_ids.add(job_id)
@@ -429,13 +522,21 @@ def load_config(arguments: argparse.Namespace) -> RunConfig:
     mode = getattr(arguments, "mode", None) or (
         "benchmark" if getattr(arguments, "wait_all", False) else "portfolio"
     )
+    containers = load_containers(containers_path)
+    jobs = load_jobs(jobs_path)
+    container_solvers = {container.solver for container in containers}
+    missing_solvers = sorted({job.solver for job in jobs} - container_solvers)
+    if missing_solvers:
+        raise InputError(
+            "в containers.tsv нет контейнеров для solver: " + ", ".join(missing_solvers)
+        )
     return RunConfig(
         containers_path=containers_path,
         jobs_path=jobs_path,
         mode=mode,
         output_dir=output_dir,
-        containers=load_containers(containers_path),
-        jobs=load_jobs(jobs_path),
+        containers=containers,
+        jobs=jobs,
     )
 
 
@@ -617,14 +718,24 @@ def option_name(line: str) -> str | None:
     return name.strip(" \t\r\n\"'")
 
 
-def make_effective_options(source: str) -> str:
-    forced_names = {name for name, _ in FORCED_OPTIONS}
+def force_options(source: str, forced: tuple[tuple[str, str], ...]) -> str:
+    forced_names = {name for name, _ in forced}
     lines = [line for line in source.splitlines() if option_name(line) not in forced_names]
     if lines and lines[-1] != "":
         lines.append("")
     lines.append("# Задано parallel_runner.py")
-    lines.extend(f"{name} = {value}" for name, value in FORCED_OPTIONS)
+    lines.extend(f"{name} = {value}" for name, value in forced)
     return "\n".join(lines) + "\n"
+
+
+def make_effective_options(source: str, solver: str = "highs") -> str:
+    if solver == "highs":
+        return force_options(source, HIGHS_FORCED_OPTIONS)
+    if solver == "scip":
+        return force_options(source, SCIP_FORCED_OPTIONS)
+    if solver in {"fscip", "lp_solve"}:
+        return source if not source or source.endswith("\n") else source + "\n"
+    raise InputError(f"неизвестный solver {solver!r}")
 
 
 def read_utf8(path: Path, label: str) -> str:
@@ -655,8 +766,11 @@ def prepare_content(job: JobSpec) -> PreparedContent:
         else:
             raise InputError(f"неизвестный формат модели: {job.model_format}")
         model_bytes = rendered.encode("utf-8")
-    options = make_effective_options(read_utf8(job.options_path, "options"))
-    return PreparedContent(job, model_bytes, options)
+    options = make_effective_options(read_utf8(job.options_path, "options"), job.solver)
+    auxiliary = (
+        (("runner.set", FSCIP_SCIP_OPTIONS),) if job.solver == "fscip" else ()
+    )
+    return PreparedContent(job, model_bytes, options, auxiliary)
 
 
 def prepare_all_content(jobs: tuple[JobSpec, ...]) -> tuple[PreparedContent, ...]:
@@ -679,9 +793,14 @@ def create_output(config: RunConfig, content: tuple[PreparedContent, ...]) -> tu
             artifact_dir = jobs_dir / item.job.job_id
             artifact_dir.mkdir()
             model_path = artifact_dir / f"model.{item.job.model_format}"
-            options_path = artifact_dir / "effective.options"
+            options_path = artifact_dir / f"effective{SOLVERS[item.job.solver].options_suffix}"
             model_path.write_bytes(item.model_bytes)
             options_path.write_text(item.options_text, encoding="utf-8")
+            auxiliary_paths: list[Path] = []
+            for name, source in item.auxiliary_options:
+                auxiliary_path = artifact_dir / name
+                auxiliary_path.write_text(source, encoding="utf-8")
+                auxiliary_paths.append(auxiliary_path)
             stdout_path = artifact_dir / "stdout.log"
             stderr_path = artifact_dir / "stderr.log"
             stdout_path.touch()
@@ -692,6 +811,7 @@ def create_output(config: RunConfig, content: tuple[PreparedContent, ...]) -> tu
                     artifact_dir,
                     model_path,
                     options_path,
+                    tuple(auxiliary_paths),
                     stdout_path,
                     stderr_path,
                 )
@@ -725,16 +845,88 @@ def find_docker() -> str:
     return docker
 
 
-def solver_argv(solver: str, model_name: str, options_name: str) -> list[str]:
-    if solver != "highs":
-        raise BackendError(f"неизвестный solver {solver!r}; поддерживается только highs")
-    return [
-        "highs",
-        "--model_file",
-        model_name,
-        "--options_file",
-        options_name,
-    ]
+def solver_argv(
+    solver: str,
+    model_name: str,
+    options_name: str,
+    threads: int = 1,
+) -> list[str]:
+    if solver == "highs":
+        return [
+            "highs",
+            "--model_file",
+            model_name,
+            "--options_file",
+            options_name,
+        ]
+    if solver == "scip":
+        return ["scip", "-s", options_name, "-f", model_name]
+    if solver == "fscip":
+        return [
+            "fscip",
+            options_name,
+            model_name,
+            "-sth",
+            str(threads),
+            "-sl",
+            "runner.set",
+            "-s",
+            "runner.set",
+            "-sr",
+            "runner.set",
+        ]
+    if solver == "lp_solve":
+        return [
+            "lp_solve",
+            "-rpar",
+            options_name,
+            "-time",
+            "-S1",
+            "-mps",
+            model_name,
+        ]
+    raise BackendError(f"неизвестный solver {solver!r}")
+
+
+def cpuset_size(value: str) -> int:
+    cpus: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", maxsplit=1)
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise ValueError(value)
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(item))
+    return len(cpus)
+
+
+def solver_probe_script(container: ContainerSpec) -> tuple[str, str]:
+    definition = SOLVERS[container.solver]
+    required = [definition.executable, "mkdir", "rm", "cat"]
+    if container.solver == "fscip":
+        required.append("scip")
+    checks = " ".join(required)
+    if container.solver in {"highs", "scip"}:
+        command = f"exec {definition.executable} --version"
+        marker = "highs" if container.solver == "highs" else "scip version"
+    elif container.solver == "fscip":
+        command = "fscip /dev/null /dev/null -sth 2 || true"
+        marker = "parallelized by ug"
+    else:
+        command = "exec lp_solve -h"
+        marker = "usage of lp_solve version"
+    script = (
+        f"for tool in {checks}; do "
+        'command -v "$tool" >/dev/null 2>&1 || '
+        '{ printf "missing tool: %s\\n" "$tool" >&2; exit 127; }; '
+        f"done; {command}"
+    )
+    return script, marker
 
 
 @dataclass
@@ -782,6 +974,9 @@ class DockerBackend:
             record = payload[0]
             runtime_id = str(record["Id"])
             running = bool(record["State"]["Running"])
+            host_config = record.get("HostConfig", {})
+            nano_cpus = int(host_config.get("NanoCpus") or 0)
+            cpuset_cpus = str(host_config.get("CpusetCpus") or "")
         except (ValueError, KeyError, IndexError, TypeError) as error:
             raise BackendError(
                 f"docker inspect вернул неожиданный ответ для {container.container_name!r}"
@@ -789,6 +984,28 @@ class DockerBackend:
         if not running:
             raise BackendError(f"контейнер {container.container_name!r} не запущен")
 
+        if container.solver == "fscip":
+            required_nano_cpus = container.threads * 1_000_000_000
+            if nano_cpus and nano_cpus < required_nano_cpus:
+                raise BackendError(
+                    f"контейнер {container.container_name!r} ограничен "
+                    f"{nano_cpus / 1_000_000_000:g} CPU, но threads={container.threads}"
+                )
+            if cpuset_cpus:
+                try:
+                    available_cpus = cpuset_size(cpuset_cpus)
+                except ValueError as error:
+                    raise BackendError(
+                        f"не удалось разобрать CpusetCpus контейнера "
+                        f"{container.container_name!r}: {cpuset_cpus!r}"
+                    ) from error
+                if available_cpus < container.threads:
+                    raise BackendError(
+                        f"контейнер {container.container_name!r} имеет "
+                        f"{available_cpus} CPU в cpuset, но threads={container.threads}"
+                    )
+
+        probe_script, marker = solver_probe_script(container)
         version = self._run(
             [
                 self.docker_path,
@@ -796,17 +1013,14 @@ class DockerBackend:
                 container.container_name,
                 "sh",
                 "-c",
-                'for tool in highs mkdir rm cat; do '
-                'command -v "$tool" >/dev/null 2>&1 || '
-                '{ printf "missing tool: %s\\n" "$tool" >&2; exit 127; }; '
-                'done; exec highs --version',
+                probe_script,
             ]
         )
         combined = "\n".join(part for part in (version.stdout.strip(), version.stderr.strip()) if part)
-        if version.returncode != 0 or "highs" not in combined.lower():
+        if version.returncode != 0 or marker not in combined.lower():
             raise BackendError(
                 f"контейнер {container.container_name!r} не подходит: "
-                f"HiGHS или POSIX sh недоступен ({combined or 'нет вывода'})"
+                f"{container.solver} или POSIX sh недоступен ({combined or 'нет вывода'})"
             )
         return ContainerProbe(runtime_id, inspect.stdout, combined + "\n")
 
@@ -849,7 +1063,7 @@ class DockerBackend:
         stderr_file = None
         process = None
         try:
-            for local in (job.model_path, job.options_path):
+            for local in (job.model_path, job.options_path, *job.auxiliary_paths):
                 copy = self._run(
                     [
                         self.docker_path,
@@ -864,7 +1078,12 @@ class DockerBackend:
                         f"не удалось передать {local.name} в {container.container_name}: "
                         f"{copy.stderr.strip() or copy.stdout.strip()}"
                     )
-            argv = solver_argv(job.job.solver, job.model_path.name, job.options_path.name)
+            argv = solver_argv(
+                job.job.solver,
+                job.model_path.name,
+                job.options_path.name,
+                container.threads,
+            )
             stdout_file = job.stdout_path.open("wb")
             stderr_file = job.stderr_path.open("wb")
             command = [
@@ -1006,7 +1225,9 @@ def write_probe(output_dir: Path, container: ContainerSpec, probe: ContainerProb
     target = output_dir / "containers" / container.container_id
     target.mkdir()
     (target / "inspect.json").write_text(probe.inspect_text, encoding="utf-8")
-    (target / "highs-version.txt").write_text(probe.solver_version, encoding="utf-8")
+    (target / "solver-version.txt").write_text(
+        probe.solver_version, encoding="utf-8"
+    )
 
 
 def append_stderr(job: PreparedJob, message: str) -> None:
@@ -1081,6 +1302,110 @@ def parse_highs_output(
     return status, objective, objective_value, solver_seconds
 
 
+def parse_float(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def last_match(pattern: re.Pattern[str], output: str) -> str | None:
+    matches = list(pattern.finditer(output))
+    return matches[-1].group(1) if matches else None
+
+
+def parse_scip_output(
+    stdout: str, stderr: str, exit_code: int
+) -> tuple[str, str | None, float | None, float | None]:
+    output = stdout + "\n" + stderr
+    solver_seconds = parse_float(last_match(SCIP_TIMING_RE, output))
+    if exit_code != 0:
+        return "ERROR", None, None, solver_seconds
+
+    status_text = last_match(SCIP_STATUS_RE, output)
+    if status_text is None:
+        return "UNKNOWN", None, None, solver_seconds
+
+    primal_text = last_match(SCIP_PRIMAL_BOUND_RE, output)
+    objective_text = primal_text or last_match(SCIP_OBJECTIVE_RE, output)
+    objective_value = parse_float(objective_text)
+    dual_text = last_match(SCIP_DUAL_BOUND_RE, output)
+    gap_value = parse_float(last_match(SCIP_GAP_RE, output))
+    normalized = status_text.lower()
+
+    if "infeasible or unbounded" in normalized or "unbounded or infeasible" in normalized:
+        status = "UNBOUNDED_OR_INFEASIBLE"
+    elif "optimal solution found" in normalized:
+        status = "OPTIMAL"
+    elif "infeasible" in normalized:
+        status = "INFEASIBLE"
+    elif "unbounded" in normalized:
+        status = "UNBOUNDED"
+    elif "time limit" in normalized:
+        status = "TIMEOUT"
+    elif "interrupted" in normalized or "limit reached" in normalized:
+        status = "FEASIBLE" if objective_value is not None else "UNKNOWN"
+    elif "problem is solved" in normalized:
+        primal_lower = (primal_text or "").lower()
+        dual_lower = (dual_text or "").lower()
+        if objective_value is not None and gap_value == 0.0:
+            status = "OPTIMAL"
+        elif "infinity" in primal_lower and "infinity" in dual_lower:
+            status = "UNBOUNDED" if "-" in primal_lower else "INFEASIBLE"
+        else:
+            status = "UNKNOWN"
+    else:
+        status = "UNKNOWN"
+
+    if status not in {"OPTIMAL", "FEASIBLE"} or objective_value is None:
+        return status, None, None, solver_seconds
+    return status, objective_text, objective_value, solver_seconds
+
+
+def parse_lpsolve_output(
+    stdout: str, stderr: str, exit_code: int
+) -> tuple[str, str | None, float | None, float | None]:
+    output = stdout + "\n" + stderr
+    solver_seconds = parse_float(last_match(LPSOLVE_TIMING_RE, output))
+    if exit_code != 0:
+        return "ERROR", None, None, solver_seconds
+
+    objective = last_match(LPSOLVE_OBJECTIVE_RE, output)
+    objective_value = parse_float(objective)
+    normalized = output.lower()
+    if "infeasible" in normalized:
+        status = "INFEASIBLE"
+    elif "unbounded" in normalized:
+        status = "UNBOUNDED"
+    elif "suboptimal" in normalized:
+        status = "FEASIBLE" if objective_value is not None else "UNKNOWN"
+    elif "timeout" in normalized or "time limit" in normalized:
+        status = "TIMEOUT"
+    elif objective_value is not None:
+        status = "OPTIMAL"
+    else:
+        status = "UNKNOWN"
+
+    if status not in {"OPTIMAL", "FEASIBLE"} or objective_value is None:
+        return status, None, None, solver_seconds
+    return status, objective, objective_value, solver_seconds
+
+
+def parse_solver_output(
+    solver: str, stdout: str, stderr: str, exit_code: int
+) -> tuple[str, str | None, float | None, float | None]:
+    if solver == "highs":
+        return parse_highs_output(stdout, stderr, exit_code)
+    if solver in {"scip", "fscip"}:
+        return parse_scip_output(stdout, stderr, exit_code)
+    if solver == "lp_solve":
+        return parse_lpsolve_output(stdout, stderr, exit_code)
+    return "ERROR", None, None, None
+
+
 def result_from_raw(
     active: ActiveJob,
     raw: RawExecution,
@@ -1098,7 +1423,8 @@ def result_from_raw(
     elif raw.exit_code is None:
         status, objective, objective_value, solver_seconds = "ERROR", None, None, None
     else:
-        status, objective, objective_value, solver_seconds = parse_highs_output(
+        status, objective, objective_value, solver_seconds = parse_solver_output(
+            job.solver,
             read_log(active.prepared.stdout_path),
             read_log(active.prepared.stderr_path),
             raw.exit_code,
@@ -1229,7 +1555,17 @@ def schedule(
                     or not pending
                 ):
                     continue
-                job = pending.pop(0)
+                job_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(pending)
+                        if candidate.job.solver == container.solver
+                    ),
+                    None,
+                )
+                if job_index is None:
+                    continue
+                job = pending.pop(job_index)
                 if config.mode == "portfolio" and job.job.problem_id in winners:
                     record(synthetic_result(job, "CANCELLED", "portfolio_winner"))
                     continue
@@ -1279,11 +1615,26 @@ def schedule(
                     disabled_containers.add(container_id)
                 made_progress = True
 
-            if pending and not active and len(disabled_containers) == len(config.containers):
-                for job in pending:
-                    append_stderr(job, "Нет доступных контейнеров после ошибки отмены")
+            available_solvers = {
+                container.solver
+                for container in config.containers
+                if container.container_id not in disabled_containers
+            }
+            unavailable = [
+                job for job in pending if job.job.solver not in available_solvers
+            ]
+            if unavailable:
+                unavailable_ids = {job.job.input_index for job in unavailable}
+                pending[:] = [
+                    job for job in pending if job.job.input_index not in unavailable_ids
+                ]
+                for job in unavailable:
+                    append_stderr(
+                        job,
+                        f"Нет доступных контейнеров для solver {job.job.solver!r}",
+                    )
                     record(synthetic_result(job, "ERROR", "no_available_container"))
-                pending.clear()
+                made_progress = True
 
             if active and not made_progress:
                 sleeper(poll_interval)
