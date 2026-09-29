@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run independent solver jobs on a pool of already-running containers."""
+"""Run solver jobs in a pool of already-running Docker containers."""
 
 from __future__ import annotations
 
@@ -9,40 +9,29 @@ import csv
 import json
 import math
 import os
-import random
 import re
 import shutil
 import subprocess
 import sys
 import time
 import uuid
-from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Sequence
 
 
 EXIT_OK = 0
 EXIT_RUNTIME_ERROR = 2
-EXIT_CONFLICT = 3
 EXIT_INPUT_ERROR = 64
 EXIT_INTERRUPTED = 130
 
-CONTAINER_COLUMNS = ["id", "container_name", "solver", "threads"]
-JOB_COLUMNS = [
-    "problem_id",
-    "job_id",
-    "solver",
-    "model",
-    "options",
-    "order",
-    "timeout_seconds",
-]
+CONTAINER_COLUMNS = ["container_name", "solver", "threads"]
+JOB_COLUMNS = ["job_id", "solver", "model", "options", "timeout_seconds"]
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-UINT64_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
-MAX_UINT64 = (1 << 64) - 1
-WINNING_STATUSES = {"OPTIMAL", "INFEASIBLE", "UNBOUNDED"}
+UINT_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+PROVEN_STATUSES = {"OPTIMAL", "INFEASIBLE", "UNBOUNDED"}
+
 HIGHS_FORCED_OPTIONS = (
     ("output_flag", "true"),
     ("log_to_console", "true"),
@@ -66,29 +55,6 @@ SOLVERS = {
     "fscip": SolverDefinition("fscip", ".prm", frozenset({"lp", "mps"})),
     "lp_solve": SolverDefinition("lp_solve", ".ini", frozenset({"mps"})),
 }
-
-LP_CONSTRAINT_SECTIONS = {"subject to", "such that", "st", "s.t."}
-LP_END_SECTIONS = {
-    "bounds",
-    "bound",
-    "binary",
-    "binaries",
-    "bin",
-    "general",
-    "generals",
-    "gen",
-    "integer",
-    "integers",
-    "semi-continuous",
-    "semi",
-    "semis",
-    "sos",
-    "end",
-}
-LP_CONSTRAINT_NAME_RE = re.compile(r"[ \t]*([^\s:]+)[ \t]*:")
-LP_COMPARISON_RE = re.compile(r"<=|>=|(?<![<>])=(?!=)|(?<!<)<(?!=)|(?<!>)>(?!=)")
-LP_VARIABLE_RE = re.compile(r"(?<![A-Za-z0-9_.])[A-Za-z_][A-Za-z0-9_.]*")
-LP_RESERVED = {"inf", "infinity"}
 
 HIGHS_MODEL_STATUS_RE = re.compile(
     r"^\s*Model status\s*:\s*(.*?)\s*$", re.MULTILINE | re.IGNORECASE
@@ -140,7 +106,7 @@ class InputError(Exception):
 
 
 class BackendError(Exception):
-    """The execution backend could not perform a requested operation."""
+    """Docker could not perform an operation."""
 
 
 class RunnerArgumentParser(argparse.ArgumentParser):
@@ -150,39 +116,27 @@ class RunnerArgumentParser(argparse.ArgumentParser):
 
 @dataclass(frozen=True)
 class ContainerSpec:
-    container_id: str
-    container_name: str
+    name: str
     solver: str
     threads: int
 
 
 @dataclass(frozen=True)
-class OrderSpec:
-    kind: str
-    seed: int | None = None
-
-    def text(self) -> str:
-        return f"shuffle:{self.seed}" if self.kind == "shuffle" else self.kind
-
-
-@dataclass(frozen=True)
 class JobSpec:
     input_index: int
-    problem_id: str
     job_id: str
+    solver: str
     model_path: Path
     options_path: Path
-    order: OrderSpec
     timeout_seconds: float
     model_format: str
-    solver: str
 
 
 @dataclass(frozen=True)
 class RunConfig:
     containers_path: Path
     jobs_path: Path
-    mode: str
+    wait_all: bool
     output_dir: Path
     containers: tuple[ContainerSpec, ...]
     jobs: tuple[JobSpec, ...]
@@ -199,7 +153,6 @@ class PreparedContent:
 @dataclass(frozen=True)
 class PreparedJob:
     job: JobSpec
-    artifact_dir: Path
     model_path: Path
     options_path: Path
     auxiliary_paths: tuple[Path, ...]
@@ -225,74 +178,32 @@ class RawExecution:
 @dataclass(frozen=True)
 class JobResult:
     input_index: int
-    problem_id: str
     job_id: str
-    container_id: str
     container_name: str
     solver: str
-    order: str
     timeout_seconds: float
     status: str
     objective: str | None
-    objective_value: float | None
     solver_seconds: float | None
     container_seconds: float
     exit_code: int | None
     cancel_reason: str
-
-
-@dataclass(frozen=True)
-class Conflict:
-    problem_id: str
-    kind: str
-    details: str
-
-
-@dataclass(frozen=True)
-class ScheduleOutcome:
-    results: tuple[JobResult, ...]
-    winners: dict[str, JobResult]
-    interrupted: bool
-
-
-@dataclass(frozen=True)
-class MpsLayout:
-    lines: tuple[str, ...]
-    constraint_positions: tuple[int, ...]
-    arities: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class LpLayout:
-    prefix: tuple[str, ...]
-    constraint_blocks: tuple[tuple[str, ...], ...]
-    arities: tuple[int, ...]
-    suffix: tuple[str, ...]
+    selected: bool = False
 
 
 @dataclass
 class ActiveJob:
     container: ContainerSpec
     prepared: PreparedJob
-    handle: object
+    handle: DockerHandle
     started_at: float
 
 
-class RunnerBackend(Protocol):
-    def probe(self, container: ContainerSpec) -> ContainerProbe:
-        ...
-
-    def start(self, container: ContainerSpec, job: PreparedJob) -> object:
-        ...
-
-    def poll(self, handle: object) -> int | None:
-        ...
-
-    def complete(self, handle: object) -> RawExecution:
-        ...
-
-    def cancel(self, handle: object, reason: str) -> RawExecution:
-        ...
+@dataclass(frozen=True)
+class RunOutcome:
+    results: tuple[JobResult, ...]
+    selected_job_id: str | None
+    interrupted: bool
 
 
 def build_parser() -> RunnerArgumentParser:
@@ -301,16 +212,10 @@ def build_parser() -> RunnerArgumentParser:
     )
     parser.add_argument("--containers", required=True, type=Path)
     parser.add_argument("--jobs", required=True, type=Path)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--mode",
-        choices=("benchmark", "portfolio"),
-        help="явно выбрать режим; по умолчанию portfolio",
-    )
-    mode.add_argument(
+    parser.add_argument(
         "--wait-all",
         action="store_true",
-        help="выполнить все job (эквивалент --mode benchmark)",
+        help="дождаться всех job, а не первого доказанного результата",
     )
     parser.add_argument("--output", required=True, type=Path)
     return parser
@@ -329,7 +234,6 @@ def read_tsv(path: Path, expected_columns: list[str], label: str) -> list[dict[s
         source = path.open("r", encoding="utf-8-sig", newline="")
     except (OSError, UnicodeError) as error:
         raise InputError(f"не удалось прочитать {label}: {error}") from error
-
     rows: list[dict[str, str]] = []
     with source:
         reader = csv.DictReader(source, delimiter="\t")
@@ -351,63 +255,44 @@ def read_tsv(path: Path, expected_columns: list[str], label: str) -> list[dict[s
 def parse_identifier(value: str, label: str, line_number: int) -> str:
     if not ID_RE.fullmatch(value):
         raise InputError(
-            f"строка {line_number}: {label} должен соответствовать {ID_RE.pattern!r}, "
-            f"получено {value!r}"
+            f"строка {line_number}: {label} должен соответствовать "
+            f"{ID_RE.pattern!r}, получено {value!r}"
         )
     return value
 
 
 def parse_solver(value: str, line_number: int) -> str:
     if value not in SOLVERS:
-        allowed = ", ".join(SOLVERS)
         raise InputError(
-            f"строка {line_number}: solver должен быть одним из: {allowed}; "
-            f"получено {value!r}"
+            f"строка {line_number}: solver должен быть одним из: "
+            f"{', '.join(SOLVERS)}; получено {value!r}"
         )
     return value
 
 
 def parse_threads(value: str, solver: str, line_number: int) -> int:
-    if not UINT64_RE.fullmatch(value):
+    if not UINT_RE.fullmatch(value) or value == "0":
         raise InputError(f"строка {line_number}: threads должен быть целым числом > 0")
     threads = int(value)
-    if threads == 0:
-        raise InputError(f"строка {line_number}: threads должен быть целым числом > 0")
-    if solver == "fscip":
-        if threads < 2:
-            raise InputError(
-                f"строка {line_number}: для fscip threads должен быть не меньше 2"
-            )
-    elif threads != 1:
+    if solver == "fscip" and threads < 2:
+        raise InputError(f"строка {line_number}: для fscip threads должен быть не меньше 2")
+    if solver != "fscip" and threads != 1:
         raise InputError(
             f"строка {line_number}: для solver {solver!r} threads должен быть равен 1"
         )
     return threads
 
 
-def load_containers(path: Path) -> tuple[ContainerSpec, ...]:
-    rows = read_tsv(path, CONTAINER_COLUMNS, "containers.tsv")
-    if not rows:
-        raise InputError("containers.tsv не содержит контейнеров")
-    result: list[ContainerSpec] = []
-    ids: set[str] = set()
-    names: set[str] = set()
-    for row in rows:
-        line = int(row["__line__"])
-        container_id = parse_identifier(row["id"], "id", line)
-        name = row["container_name"]
-        if not CONTAINER_NAME_RE.fullmatch(name):
-            raise InputError(f"строка {line}: недопустимое container_name {name!r}")
-        if container_id in ids:
-            raise InputError(f"строка {line}: повторяющийся id {container_id!r}")
-        if name in names:
-            raise InputError(f"строка {line}: контейнер {name!r} указан повторно")
-        solver = parse_solver(row["solver"], line)
-        threads = parse_threads(row["threads"], solver, line)
-        ids.add(container_id)
-        names.add(name)
-        result.append(ContainerSpec(container_id, name, solver, threads))
-    return tuple(result)
+def parse_timeout(value: str, line_number: int) -> float:
+    try:
+        timeout = float(value)
+    except ValueError as error:
+        raise InputError(f"строка {line_number}: timeout_seconds должен быть числом") from error
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise InputError(
+            f"строка {line_number}: timeout_seconds должен быть конечным числом > 0"
+        )
+    return timeout
 
 
 def resolve_manifest_path(manifest: Path, value: str) -> Path:
@@ -417,29 +302,6 @@ def resolve_manifest_path(manifest: Path, value: str) -> Path:
     return path.resolve()
 
 
-def parse_order(value: str, line_number: int) -> OrderSpec:
-    if value == "original":
-        return OrderSpec("original")
-    if value == "low-arity-first":
-        return OrderSpec("low-arity-first")
-    if value.startswith("shuffle:"):
-        seed_text = value.removeprefix("shuffle:")
-        if not UINT64_RE.fullmatch(seed_text):
-            raise InputError(
-                f"строка {line_number}: seed в order должен быть uint64"
-            )
-        seed = int(seed_text)
-        if seed > MAX_UINT64:
-            raise InputError(
-                f"строка {line_number}: seed в order превышает uint64"
-            )
-        return OrderSpec("shuffle", seed)
-    raise InputError(
-        f"строка {line_number}: order должен быть original, shuffle:<uint64> "
-        "или low-arity-first"
-    )
-
-
 def detect_model_format(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".lp", ".mps"}:
@@ -447,18 +309,23 @@ def detect_model_format(path: Path) -> str:
     raise InputError(f"модель должна иметь расширение .lp или .mps: {path}")
 
 
-def parse_timeout(value: str, line_number: int) -> float:
-    try:
-        timeout = float(value)
-    except ValueError as error:
-        raise InputError(
-            f"строка {line_number}: timeout_seconds должен быть числом"
-        ) from error
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise InputError(
-            f"строка {line_number}: timeout_seconds должен быть конечным числом > 0"
-        )
-    return timeout
+def load_containers(path: Path) -> tuple[ContainerSpec, ...]:
+    rows = read_tsv(path, CONTAINER_COLUMNS, "containers.tsv")
+    if not rows:
+        raise InputError("containers.tsv не содержит контейнеров")
+    result: list[ContainerSpec] = []
+    names: set[str] = set()
+    for row in rows:
+        line = int(row["__line__"])
+        name = row["container_name"]
+        if not CONTAINER_NAME_RE.fullmatch(name):
+            raise InputError(f"строка {line}: недопустимое container_name {name!r}")
+        if name in names:
+            raise InputError(f"строка {line}: контейнер {name!r} указан повторно")
+        solver = parse_solver(row["solver"], line)
+        result.append(ContainerSpec(name, solver, parse_threads(row["threads"], solver, line)))
+        names.add(name)
+    return tuple(result)
 
 
 def load_jobs(path: Path) -> tuple[JobSpec, ...]:
@@ -469,7 +336,6 @@ def load_jobs(path: Path) -> tuple[JobSpec, ...]:
     job_ids: set[str] = set()
     for input_index, row in enumerate(rows):
         line = int(row["__line__"])
-        problem_id = parse_identifier(row["problem_id"], "problem_id", line)
         job_id = parse_identifier(row["job_id"], "job_id", line)
         if job_id in job_ids:
             raise InputError(f"строка {line}: повторяющийся job_id {job_id!r}")
@@ -478,8 +344,6 @@ def load_jobs(path: Path) -> tuple[JobSpec, ...]:
         options_path = resolve_manifest_path(path, row["options"])
         require_readable_file(model_path, f"модель в строке {line}")
         require_readable_file(options_path, f"options в строке {line}")
-        order = parse_order(row["order"], line)
-        timeout = parse_timeout(row["timeout_seconds"], line)
         model_format = detect_model_format(model_path)
         definition = SOLVERS[solver]
         if model_format not in definition.model_formats:
@@ -494,15 +358,13 @@ def load_jobs(path: Path) -> tuple[JobSpec, ...]:
             )
         result.append(
             JobSpec(
-                input_index=input_index,
-                problem_id=problem_id,
-                job_id=job_id,
-                model_path=model_path,
-                options_path=options_path,
-                order=order,
-                timeout_seconds=timeout,
-                model_format=model_format,
-                solver=solver,
+                input_index,
+                job_id,
+                solver,
+                model_path,
+                options_path,
+                parse_timeout(row["timeout_seconds"], line),
+                model_format,
             )
         )
         job_ids.add(job_id)
@@ -516,206 +378,21 @@ def load_config(arguments: argparse.Namespace) -> RunConfig:
     if output_dir.exists() or output_dir.is_symlink():
         raise InputError(f"выходной каталог уже существует: {output_dir}")
     if output_dir.parent.exists() and not output_dir.parent.is_dir():
-        raise InputError(
-            f"родитель выходного каталога не является каталогом: {output_dir.parent}"
-        )
-    mode = getattr(arguments, "mode", None) or (
-        "benchmark" if getattr(arguments, "wait_all", False) else "portfolio"
-    )
+        raise InputError(f"родитель выходного каталога не является каталогом")
     containers = load_containers(containers_path)
     jobs = load_jobs(jobs_path)
-    container_solvers = {container.solver for container in containers}
-    missing_solvers = sorted({job.solver for job in jobs} - container_solvers)
-    if missing_solvers:
-        raise InputError(
-            "в containers.tsv нет контейнеров для solver: " + ", ".join(missing_solvers)
-        )
-    return RunConfig(
-        containers_path=containers_path,
-        jobs_path=jobs_path,
-        mode=mode,
-        output_dir=output_dir,
-        containers=containers,
-        jobs=jobs,
-    )
-
-
-def normalize_lp_section(line: str) -> str:
-    return " ".join(line.strip().lower().split())
-
-
-def lp_block_arity(block: tuple[str, ...], name: str) -> int:
-    text = "".join(line.split("\\", maxsplit=1)[0] for line in block)
-    text = LP_CONSTRAINT_NAME_RE.sub("", text, count=1)
-    match = LP_COMPARISON_RE.search(text)
-    expression = text[: match.start()] if match else text
-    variables = {
-        token
-        for token in LP_VARIABLE_RE.findall(expression)
-        if token.lower() not in LP_RESERVED and token != name
-    }
-    return len(variables)
-
-
-def parse_lp_layout(source: str) -> LpLayout:
-    lines = tuple(source.splitlines(keepends=True))
-    masked = tuple(line.split("\\", maxsplit=1)[0] for line in lines)
-    headers = [
-        index
-        for index, line in enumerate(masked)
-        if normalize_lp_section(line) in LP_CONSTRAINT_SECTIONS
-    ]
-    if len(headers) != 1:
-        raise InputError("LP должен содержать ровно одну секцию Subject To")
-    section_start = headers[0]
-    section_end = len(lines)
-    for index in range(section_start + 1, len(lines)):
-        if normalize_lp_section(masked[index]) in LP_END_SECTIONS:
-            section_end = index
-            break
-
-    starts: list[int] = []
-    names: list[str] = []
-    for index in range(section_start + 1, section_end):
-        match = LP_CONSTRAINT_NAME_RE.match(masked[index])
-        if match:
-            starts.append(index)
-            names.append(match.group(1))
-    if not starts:
-        raise InputError("секция Subject To не содержит именованных ограничений")
-    if len(names) != len(set(names)):
-        raise InputError("имена ограничений LP должны быть уникальными")
-    if "".join(masked[section_start + 1 : starts[0]]).strip():
-        raise InputError("обнаружено безымянное ограничение в начале Subject To")
-
-    blocks: list[tuple[str, ...]] = []
-    arities: list[int] = []
-    for number, start in enumerate(starts):
-        end = starts[number + 1] if number + 1 < len(starts) else section_end
-        block = lines[start:end]
-        comparisons = LP_COMPARISON_RE.findall("".join(masked[start:end]))
-        if len(comparisons) != 1:
-            raise InputError(
-                f"ограничение {names[number]!r} неоднозначно: ожидался один "
-                f"оператор сравнения, найдено {len(comparisons)}"
-            )
-        blocks.append(block)
-        arities.append(lp_block_arity(block, names[number]))
-    return LpLayout(
-        prefix=lines[: starts[0]],
-        constraint_blocks=tuple(blocks),
-        arities=tuple(arities),
-        suffix=lines[section_end:],
-    )
-
-
-def mps_section(line: str) -> str | None:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("*"):
-        return None
-    fields = stripped.split()
-    if len(fields) != 1:
-        return None
-    section = fields[0].upper()
-    if section in {"ROWS", "COLUMNS", "RHS", "RANGES", "BOUNDS", "ENDATA"}:
-        return section
-    return None
-
-
-def parse_mps_layout(source: str) -> MpsLayout:
-    lines = tuple(source.splitlines(keepends=True))
-    rows_headers = [i for i, line in enumerate(lines) if mps_section(line) == "ROWS"]
-    if len(rows_headers) != 1:
-        raise InputError("MPS должен содержать ровно одну секцию ROWS")
-    rows_start = rows_headers[0]
-    columns_headers = [
-        i for i in range(rows_start + 1, len(lines)) if mps_section(lines[i]) == "COLUMNS"
-    ]
-    if not columns_headers:
-        raise InputError("после ROWS в MPS не найдена секция COLUMNS")
-    rows_end = columns_headers[0]
-
-    positions: list[int] = []
-    names: list[str] = []
-    all_names: set[str] = set()
-    for index in range(rows_start + 1, rows_end):
-        stripped = lines[index].strip()
-        if not stripped or stripped.startswith("*"):
-            continue
-        fields = stripped.split()
-        if len(fields) != 2 or fields[0].upper() not in {"N", "E", "L", "G"}:
-            raise InputError(f"неоднозначная строка {index + 1} секции ROWS в MPS")
-        name = fields[1]
-        if name in all_names:
-            raise InputError(f"повторяющееся имя строки {name!r} в MPS")
-        all_names.add(name)
-        if fields[0].upper() != "N":
-            positions.append(index)
-            names.append(name)
-
-    arity_sets = {name: set() for name in names}
-    constraint_names = set(names)
-    columns_start = rows_end
-    columns_end = len(lines)
-    for index in range(columns_start + 1, len(lines)):
-        if mps_section(lines[index]) in {"RHS", "RANGES", "BOUNDS", "ENDATA"}:
-            columns_end = index
-            break
-    for index in range(columns_start + 1, columns_end):
-        stripped = lines[index].strip()
-        if not stripped or stripped.startswith("*"):
-            continue
-        fields = stripped.split()
-        if "MARKER" in {field.strip("'").upper() for field in fields}:
-            continue
-        if len(fields) not in {3, 5}:
-            raise InputError(f"неоднозначная строка {index + 1} секции COLUMNS в MPS")
-        column = fields[0]
-        pairs = fields[1:]
-        for pair_index in range(0, len(pairs), 2):
-            row_name = pairs[pair_index]
-            if row_name in constraint_names:
-                arity_sets[row_name].add(column)
-    return MpsLayout(
-        lines=lines,
-        constraint_positions=tuple(positions),
-        arities=tuple(len(arity_sets[name]) for name in names),
-    )
-
-
-def ordered_indices(count: int, arities: tuple[int, ...], order: OrderSpec) -> list[int]:
-    indices = list(range(count))
-    if order.kind == "shuffle":
-        assert order.seed is not None
-        random.Random(order.seed).shuffle(indices)
-    elif order.kind == "low-arity-first":
-        indices.sort(key=lambda index: arities[index])
-    elif order.kind != "original":
-        raise InputError(f"неизвестный порядок ограничений: {order.kind}")
-    return indices
-
-
-def render_lp(layout: LpLayout, order: OrderSpec) -> str:
-    indices = ordered_indices(len(layout.constraint_blocks), layout.arities, order)
-    body = [line for index in indices for line in layout.constraint_blocks[index]]
-    return "".join((*layout.prefix, *body, *layout.suffix))
-
-
-def render_mps(layout: MpsLayout, order: OrderSpec) -> str:
-    result = list(layout.lines)
-    indices = ordered_indices(len(layout.constraint_positions), layout.arities, order)
-    reordered = [layout.lines[layout.constraint_positions[index]] for index in indices]
-    for position, line in zip(layout.constraint_positions, reordered):
-        result[position] = line
-    return "".join(result)
+    missing = sorted({job.solver for job in jobs} - {item.solver for item in containers})
+    if missing:
+        raise InputError("в containers.tsv нет контейнеров для solver: " + ", ".join(missing))
+    return RunConfig(containers_path, jobs_path, arguments.wait_all, output_dir, containers, jobs)
 
 
 def option_name(line: str) -> str | None:
     stripped = line.strip()
-    if not stripped or stripped.startswith("#") or "=" not in line:
+    if not stripped or stripped.startswith("#"):
         return None
-    name, _ = line.split("=", maxsplit=1)
-    return name.strip(" \t\r\n\"'")
+    match = re.match(r"([^=\s]+)\s*=", stripped)
+    return match.group(1) if match else None
 
 
 def force_options(source: str, forced: tuple[tuple[str, str], ...]) -> str:
@@ -728,14 +405,12 @@ def force_options(source: str, forced: tuple[tuple[str, str], ...]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def make_effective_options(source: str, solver: str = "highs") -> str:
+def make_effective_options(source: str, solver: str) -> str:
     if solver == "highs":
         return force_options(source, HIGHS_FORCED_OPTIONS)
     if solver == "scip":
         return force_options(source, SCIP_FORCED_OPTIONS)
-    if solver in {"fscip", "lp_solve"}:
-        return source if not source or source.endswith("\n") else source + "\n"
-    raise InputError(f"неизвестный solver {solver!r}")
+    return source if not source or source.endswith("\n") else source + "\n"
 
 
 def read_utf8(path: Path, label: str) -> str:
@@ -745,36 +420,17 @@ def read_utf8(path: Path, label: str) -> str:
         raise InputError(f"не удалось прочитать {label} {path}: {error}") from error
 
 
-def prepare_content(job: JobSpec) -> PreparedContent:
-    try:
-        original = job.model_path.read_bytes()
-    except OSError as error:
-        raise InputError(f"не удалось прочитать модель {job.model_path}: {error}") from error
-    if job.order.kind == "original":
-        model_bytes = original
-    else:
+def prepare_content(jobs: tuple[JobSpec, ...]) -> tuple[PreparedContent, ...]:
+    result: list[PreparedContent] = []
+    for job in jobs:
         try:
-            source = original.decode("utf-8")
-        except UnicodeError as error:
-            raise InputError(
-                f"для изменения порядка модель должна быть UTF-8: {job.model_path}"
-            ) from error
-        if job.model_format == "lp":
-            rendered = render_lp(parse_lp_layout(source), job.order)
-        elif job.model_format == "mps":
-            rendered = render_mps(parse_mps_layout(source), job.order)
-        else:
-            raise InputError(f"неизвестный формат модели: {job.model_format}")
-        model_bytes = rendered.encode("utf-8")
-    options = make_effective_options(read_utf8(job.options_path, "options"), job.solver)
-    auxiliary = (
-        (("runner.set", FSCIP_SCIP_OPTIONS),) if job.solver == "fscip" else ()
-    )
-    return PreparedContent(job, model_bytes, options, auxiliary)
-
-
-def prepare_all_content(jobs: tuple[JobSpec, ...]) -> tuple[PreparedContent, ...]:
-    return tuple(prepare_content(job) for job in jobs)
+            model_bytes = job.model_path.read_bytes()
+        except OSError as error:
+            raise InputError(f"не удалось прочитать модель {job.model_path}: {error}") from error
+        options = make_effective_options(read_utf8(job.options_path, "options"), job.solver)
+        auxiliary = (("runner.set", FSCIP_SCIP_OPTIONS),) if job.solver == "fscip" else ()
+        result.append(PreparedContent(job, model_bytes, options, auxiliary))
+    return tuple(result)
 
 
 def create_output(config: RunConfig, content: tuple[PreparedContent, ...]) -> tuple[PreparedJob, ...]:
@@ -782,10 +438,9 @@ def create_output(config: RunConfig, content: tuple[PreparedContent, ...]) -> tu
         config.output_dir.mkdir(parents=True, exist_ok=False)
         inputs_dir = config.output_dir / "inputs"
         jobs_dir = config.output_dir / "jobs"
-        containers_dir = config.output_dir / "containers"
+        (config.output_dir / "containers").mkdir()
         inputs_dir.mkdir()
         jobs_dir.mkdir()
-        containers_dir.mkdir()
         shutil.copyfile(config.containers_path, inputs_dir / "containers.tsv")
         shutil.copyfile(config.jobs_path, inputs_dir / "jobs.tsv")
         prepared: list[PreparedJob] = []
@@ -798,9 +453,9 @@ def create_output(config: RunConfig, content: tuple[PreparedContent, ...]) -> tu
             options_path.write_text(item.options_text, encoding="utf-8")
             auxiliary_paths: list[Path] = []
             for name, source in item.auxiliary_options:
-                auxiliary_path = artifact_dir / name
-                auxiliary_path.write_text(source, encoding="utf-8")
-                auxiliary_paths.append(auxiliary_path)
+                path = artifact_dir / name
+                path.write_text(source, encoding="utf-8")
+                auxiliary_paths.append(path)
             stdout_path = artifact_dir / "stdout.log"
             stderr_path = artifact_dir / "stderr.log"
             stdout_path.touch()
@@ -808,7 +463,6 @@ def create_output(config: RunConfig, content: tuple[PreparedContent, ...]) -> tu
             prepared.append(
                 PreparedJob(
                     item.job,
-                    artifact_dir,
                     model_path,
                     options_path,
                     tuple(auxiliary_paths),
@@ -816,6 +470,7 @@ def create_output(config: RunConfig, content: tuple[PreparedContent, ...]) -> tu
                     stderr_path,
                 )
             )
+        write_results(config.output_dir, ())
         return tuple(prepared)
     except FileExistsError as error:
         raise InputError(f"выходной каталог уже существует: {config.output_dir}") from error
@@ -845,20 +500,9 @@ def find_docker() -> str:
     return docker
 
 
-def solver_argv(
-    solver: str,
-    model_name: str,
-    options_name: str,
-    threads: int = 1,
-) -> list[str]:
+def solver_argv(solver: str, model_name: str, options_name: str, threads: int) -> list[str]:
     if solver == "highs":
-        return [
-            "highs",
-            "--model_file",
-            model_name,
-            "--options_file",
-            options_name,
-        ]
+        return ["highs", "--model_file", model_name, "--options_file", options_name]
     if solver == "scip":
         return ["scip", "-s", options_name, "-f", model_name]
     if solver == "fscip":
@@ -876,15 +520,7 @@ def solver_argv(
             "runner.set",
         ]
     if solver == "lp_solve":
-        return [
-            "lp_solve",
-            "-rpar",
-            options_name,
-            "-time",
-            "-S1",
-            "-mps",
-            model_name,
-        ]
+        return ["lp_solve", "-rpar", options_name, "-time", "-S1", "-mps", model_name]
     raise BackendError(f"неизвестный solver {solver!r}")
 
 
@@ -906,13 +542,13 @@ def cpuset_size(value: str) -> int:
 
 
 def solver_probe_script(container: ContainerSpec) -> tuple[str, str]:
-    definition = SOLVERS[container.solver]
-    required = [definition.executable, "mkdir", "rm", "cat"]
+    executable = SOLVERS[container.solver].executable
+    required = [executable, "mkdir", "rm", "cat"]
     if container.solver == "fscip":
         required.append("scip")
     checks = " ".join(required)
     if container.solver in {"highs", "scip"}:
-        command = f"exec {definition.executable} --version"
+        command = f"exec {executable} --version"
         marker = "highs" if container.solver == "highs" else "scip version"
     elif container.solver == "fscip":
         command = "fscip /dev/null /dev/null -sth 2 || true"
@@ -931,22 +567,19 @@ def solver_probe_script(container: ContainerSpec) -> tuple[str, str]:
 
 @dataclass
 class DockerHandle:
-    process: subprocess.Popen[bytes] | None
-    stdout_file: object | None
-    stderr_file: object | None
+    process: subprocess.Popen[bytes]
+    stdout_file: object
+    stderr_file: object
     container: ContainerSpec
     remote_dir: str
     finished: bool = False
 
 
 class DockerBackend:
-    """Backend that only uses docker exec/cp against user-owned containers."""
-
     def __init__(self, docker_path: str, grace_seconds: float = 2.0) -> None:
         self.docker_path = docker_path
         self.grace_seconds = grace_seconds
-        self.run_token = f"{os.getpid()}-{uuid.uuid4().hex}"
-        self.remote_root = f"/tmp/lp-parallel-runner-{self.run_token}"
+        self.remote_root = f"/tmp/lp-parallel-runner-{os.getpid()}-{uuid.uuid4().hex}"
 
     def _run(self, command: list[str], timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
         try:
@@ -963,100 +596,79 @@ class DockerBackend:
             raise BackendError(f"не удалось выполнить {' '.join(command[:3])}: {error}") from error
 
     def probe(self, container: ContainerSpec) -> ContainerProbe:
-        inspect = self._run([self.docker_path, "inspect", container.container_name])
+        inspect = self._run([self.docker_path, "inspect", container.name])
         if inspect.returncode != 0:
             details = inspect.stderr.strip() or inspect.stdout.strip()
-            raise BackendError(
-                f"контейнер {container.container_name!r} не найден: {details}"
-            )
+            raise BackendError(f"контейнер {container.name!r} не найден: {details}")
         try:
-            payload = json.loads(inspect.stdout)
-            record = payload[0]
+            record = json.loads(inspect.stdout)[0]
             runtime_id = str(record["Id"])
             running = bool(record["State"]["Running"])
             host_config = record.get("HostConfig", {})
             nano_cpus = int(host_config.get("NanoCpus") or 0)
             cpuset_cpus = str(host_config.get("CpusetCpus") or "")
         except (ValueError, KeyError, IndexError, TypeError) as error:
-            raise BackendError(
-                f"docker inspect вернул неожиданный ответ для {container.container_name!r}"
-            ) from error
+            raise BackendError(f"docker inspect вернул неожиданный ответ для {container.name!r}") from error
         if not running:
-            raise BackendError(f"контейнер {container.container_name!r} не запущен")
-
+            raise BackendError(f"контейнер {container.name!r} не запущен")
         if container.solver == "fscip":
-            required_nano_cpus = container.threads * 1_000_000_000
-            if nano_cpus and nano_cpus < required_nano_cpus:
+            if nano_cpus and nano_cpus < container.threads * 1_000_000_000:
                 raise BackendError(
-                    f"контейнер {container.container_name!r} ограничен "
+                    f"контейнер {container.name!r} ограничен "
                     f"{nano_cpus / 1_000_000_000:g} CPU, но threads={container.threads}"
                 )
             if cpuset_cpus:
                 try:
-                    available_cpus = cpuset_size(cpuset_cpus)
+                    available = cpuset_size(cpuset_cpus)
                 except ValueError as error:
+                    raise BackendError(f"не удалось разобрать CpusetCpus {cpuset_cpus!r}") from error
+                if available < container.threads:
                     raise BackendError(
-                        f"не удалось разобрать CpusetCpus контейнера "
-                        f"{container.container_name!r}: {cpuset_cpus!r}"
-                    ) from error
-                if available_cpus < container.threads:
-                    raise BackendError(
-                        f"контейнер {container.container_name!r} имеет "
-                        f"{available_cpus} CPU в cpuset, но threads={container.threads}"
+                        f"контейнер {container.name!r} имеет {available} CPU, "
+                        f"но threads={container.threads}"
                     )
-
-        probe_script, marker = solver_probe_script(container)
-        version = self._run(
-            [
-                self.docker_path,
-                "exec",
-                container.container_name,
-                "sh",
-                "-c",
-                probe_script,
-            ]
+        script, marker = solver_probe_script(container)
+        version = self._run([self.docker_path, "exec", container.name, "sh", "-c", script])
+        combined = "\n".join(
+            part for part in (version.stdout.strip(), version.stderr.strip()) if part
         )
-        combined = "\n".join(part for part in (version.stdout.strip(), version.stderr.strip()) if part)
         if version.returncode != 0 or marker not in combined.lower():
             raise BackendError(
-                f"контейнер {container.container_name!r} не подходит: "
+                f"контейнер {container.name!r} не подходит: "
                 f"{container.solver} или POSIX sh недоступен ({combined or 'нет вывода'})"
             )
         return ContainerProbe(runtime_id, inspect.stdout, combined + "\n")
 
-    def _remote_command(self, container: ContainerSpec, script: str, *args: str) -> subprocess.CompletedProcess[str]:
+    def _remote_command(
+        self, container: ContainerSpec, script: str, *args: str
+    ) -> subprocess.CompletedProcess[str]:
         return self._run(
-            [self.docker_path, "exec", container.container_name, "sh", "-c", script, "runner", *args]
+            [self.docker_path, "exec", container.name, "sh", "-c", script, "runner", *args]
         )
 
-    def _cleanup(self, handle: DockerHandle) -> None:
-        expected = self.remote_root + "/"
-        if not handle.remote_dir.startswith(expected):
+    def _cleanup(self, container: ContainerSpec, remote_dir: str) -> None:
+        if not remote_dir.startswith(self.remote_root + "/"):
             raise BackendError("отказ от очистки каталога вне namespace runner")
         result = self._remote_command(
-            handle.container,
+            container,
             'rm -rf -- "$1"; status=$?; '
             'if [ "$status" -eq 0 ]; then rmdir -- "$2" 2>/dev/null || true; fi; '
             'exit "$status"',
-            handle.remote_dir,
+            remote_dir,
             self.remote_root,
         )
         if result.returncode != 0:
             raise BackendError(
-                f"не удалось очистить каталог job в {handle.container.container_name}: "
+                f"не удалось очистить каталог job в {container.name}: "
                 f"{result.stderr.strip() or result.stdout.strip()}"
             )
 
     def start(self, container: ContainerSpec, job: PreparedJob) -> DockerHandle:
         remote_dir = f"{self.remote_root}/{job.job.input_index}-{uuid.uuid4().hex}"
-        create = self._remote_command(
-            container,
-            'umask 077; mkdir -p -- "$1"',
-            remote_dir,
-        )
+        create = self._remote_command(container, 'umask 077; mkdir -p -- "$1"', remote_dir)
         if create.returncode != 0:
             raise BackendError(
-                f"не удалось создать каталог job в {container.container_name}: "
+                f"не удалось создать каталог job в {container.name}: "
                 f"{create.stderr.strip() or create.stdout.strip()}"
             )
         stdout_file = None
@@ -1065,17 +677,12 @@ class DockerBackend:
         try:
             for local in (job.model_path, job.options_path, *job.auxiliary_paths):
                 copy = self._run(
-                    [
-                        self.docker_path,
-                        "cp",
-                        str(local),
-                        f"{container.container_name}:{remote_dir}/{local.name}",
-                    ],
+                    [self.docker_path, "cp", str(local), f"{container.name}:{remote_dir}/{local.name}"],
                     timeout=120,
                 )
                 if copy.returncode != 0:
                     raise BackendError(
-                        f"не удалось передать {local.name} в {container.container_name}: "
+                        f"не удалось передать {local.name} в {container.name}: "
                         f"{copy.stderr.strip() or copy.stdout.strip()}"
                     )
             argv = solver_argv(
@@ -1086,37 +693,29 @@ class DockerBackend:
             )
             stdout_file = job.stdout_path.open("wb")
             stderr_file = job.stderr_path.open("wb")
-            command = [
-                self.docker_path,
-                "exec",
-                container.container_name,
-                "sh",
-                "-c",
-                'cd "$1" || exit 125; printf "%s\\n" "$$" > runner.pid || exit 125; '
-                'shift; exec "$@"',
-                "runner",
-                remote_dir,
-                *argv,
-            ]
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                )
-            except OSError as error:
-                stdout_file.close()
-                stderr_file.close()
-                raise BackendError(f"не удалось запустить docker exec: {error}") from error
+            process = subprocess.Popen(
+                [
+                    self.docker_path,
+                    "exec",
+                    container.name,
+                    "sh",
+                    "-c",
+                    'cd "$1" || exit 125; printf "%s\\n" "$$" > runner.pid || exit 125; '
+                    'shift; exec "$@"',
+                    "runner",
+                    remote_dir,
+                    *argv,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
             return DockerHandle(process, stdout_file, stderr_file, container, remote_dir)
         except (Exception, KeyboardInterrupt) as error:
             if process is not None and stdout_file is not None and stderr_file is not None:
                 try:
                     self.cancel(
-                        DockerHandle(
-                            process, stdout_file, stderr_file, container, remote_dir
-                        ),
+                        DockerHandle(process, stdout_file, stderr_file, container, remote_dir),
                         "interrupt" if isinstance(error, KeyboardInterrupt) else "start_error",
                     )
                 except BackendError:
@@ -1127,13 +726,15 @@ class DockerBackend:
                 if stderr_file is not None:
                     stderr_file.close()
                 try:
-                    self._cleanup(DockerHandle(None, None, None, container, remote_dir))
+                    self._cleanup(container, remote_dir)
                 except BackendError:
                     pass
+            if isinstance(error, OSError):
+                raise BackendError(f"не удалось запустить docker exec: {error}") from error
             raise
 
-    def poll(self, handle: object) -> int | None:
-        assert isinstance(handle, DockerHandle) and handle.process is not None
+    @staticmethod
+    def poll(handle: DockerHandle) -> int | None:
         return handle.process.poll()
 
     def _finish(
@@ -1144,22 +745,19 @@ class DockerBackend:
         cleanup: bool = True,
         backend_error: str = "",
     ) -> RawExecution:
-        assert handle.process is not None
         exit_code = handle.process.wait()
         if not handle.finished:
-            assert handle.stdout_file is not None and handle.stderr_file is not None
             handle.stdout_file.close()  # type: ignore[union-attr]
             handle.stderr_file.close()  # type: ignore[union-attr]
             if cleanup:
                 try:
-                    self._cleanup(handle)
+                    self._cleanup(handle.container, handle.remote_dir)
                 except BackendError as error:
                     backend_error = str(error)
             handle.finished = True
         return RawExecution(exit_code, cancel_reason, backend_error)
 
-    def complete(self, handle: object) -> RawExecution:
-        assert isinstance(handle, DockerHandle)
+    def complete(self, handle: DockerHandle) -> RawExecution:
         return self._finish(handle)
 
     def _signal(self, handle: DockerHandle, signal: str) -> None:
@@ -1172,14 +770,13 @@ class DockerBackend:
         )
         if result.returncode != 0:
             raise BackendError(
-                f"не удалось послать {signal} процессу job в "
-                f"{handle.container.container_name}: {result.stderr.strip() or result.stdout.strip()}"
+                f"не удалось послать {signal} процессу job в {handle.container.name}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
             )
 
-    def cancel(self, handle: object, reason: str) -> RawExecution:
-        assert isinstance(handle, DockerHandle) and handle.process is not None
+    def cancel(self, handle: DockerHandle, reason: str) -> RawExecution:
         if handle.process.poll() is not None:
-            return self._finish(handle)
+            return self._finish(handle, reason)
         signal_error = ""
         try:
             self._signal(handle, "TERM")
@@ -1191,43 +788,42 @@ class DockerBackend:
         except (BackendError, subprocess.TimeoutExpired) as error:
             signal_error = str(error)
             if handle.process.poll() is None:
-                # This only stops the local docker client. The error stays visible.
                 handle.process.terminate()
                 try:
                     handle.process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     handle.process.kill()
                     handle.process.wait()
-            if handle.stderr_file is not None:
-                try:
-                    handle.stderr_file.write(("\nОшибка отмены: " + signal_error + "\n").encode())  # type: ignore[union-attr]
-                except (OSError, ValueError):
-                    pass
+            try:
+                handle.stderr_file.write(("\nОшибка отмены: " + signal_error + "\n").encode())  # type: ignore[union-attr]
+            except (OSError, ValueError):
+                pass
         if signal_error:
-            # The remote process may still be alive, so its directory must not be
-            # removed. Stopping the local docker client is not treated as a kill.
             raw = self._finish(
                 handle,
                 reason,
                 cleanup=False,
                 backend_error=f"kill_error={signal_error}",
             )
-            return RawExecution(
-                raw.exit_code,
-                raw.cancel_reason,
-                raw.backend_error,
-                reusable_container=False,
-            )
+            return RawExecution(raw.exit_code, raw.cancel_reason, raw.backend_error, False)
         return self._finish(handle, reason)
 
 
 def write_probe(output_dir: Path, container: ContainerSpec, probe: ContainerProbe) -> None:
-    target = output_dir / "containers" / container.container_id
+    target = output_dir / "containers" / container.name
     target.mkdir()
     (target / "inspect.json").write_text(probe.inspect_text, encoding="utf-8")
-    (target / "solver-version.txt").write_text(
-        probe.solver_version, encoding="utf-8"
-    )
+    (target / "solver-version.txt").write_text(probe.solver_version, encoding="utf-8")
+
+
+def probe_all_containers(config: RunConfig, backend: DockerBackend) -> None:
+    runtime_ids: set[str] = set()
+    for container in config.containers:
+        probe = backend.probe(container)
+        if probe.runtime_id in runtime_ids:
+            raise BackendError("несколько строк containers.tsv указывают на один контейнер")
+        runtime_ids.add(probe.runtime_id)
+        write_probe(config.output_dir, container, probe)
 
 
 def append_stderr(job: PreparedJob, message: str) -> None:
@@ -1268,13 +864,7 @@ def parse_highs_output(
     stdout: str, stderr: str, exit_code: int
 ) -> tuple[str, str | None, float | None, float | None]:
     output = stdout + "\n" + stderr
-    timings = list(HIGHS_TIMING_RE.finditer(output))
-    solver_seconds = None
-    if timings:
-        try:
-            solver_seconds = float(timings[-1].group(1))
-        except ValueError:
-            pass
+    solver_seconds = parse_float(last_match(HIGHS_TIMING_RE, output))
     statuses = [
         (match.start(), match.group(1))
         for pattern in (HIGHS_MODEL_STATUS_RE, HIGHS_REPORT_STATUS_RE)
@@ -1295,11 +885,7 @@ def parse_highs_output(
     if not objectives:
         return status, None, None, solver_seconds
     objective = max(objectives, key=lambda item: item[0])[1]
-    try:
-        objective_value = float(objective)
-    except ValueError:
-        objective_value = None
-    return status, objective, objective_value, solver_seconds
+    return status, objective, parse_float(objective), solver_seconds
 
 
 def parse_float(value: str | None) -> float | None:
@@ -1324,18 +910,15 @@ def parse_scip_output(
     solver_seconds = parse_float(last_match(SCIP_TIMING_RE, output))
     if exit_code != 0:
         return "ERROR", None, None, solver_seconds
-
     status_text = last_match(SCIP_STATUS_RE, output)
     if status_text is None:
         return "UNKNOWN", None, None, solver_seconds
-
     primal_text = last_match(SCIP_PRIMAL_BOUND_RE, output)
     objective_text = primal_text or last_match(SCIP_OBJECTIVE_RE, output)
     objective_value = parse_float(objective_text)
     dual_text = last_match(SCIP_DUAL_BOUND_RE, output)
     gap_value = parse_float(last_match(SCIP_GAP_RE, output))
     normalized = status_text.lower()
-
     if "infeasible or unbounded" in normalized or "unbounded or infeasible" in normalized:
         status = "UNBOUNDED_OR_INFEASIBLE"
     elif "optimal solution found" in normalized:
@@ -1359,7 +942,6 @@ def parse_scip_output(
             status = "UNKNOWN"
     else:
         status = "UNKNOWN"
-
     if status not in {"OPTIMAL", "FEASIBLE"} or objective_value is None:
         return status, None, None, solver_seconds
     return status, objective_text, objective_value, solver_seconds
@@ -1372,7 +954,6 @@ def parse_lpsolve_output(
     solver_seconds = parse_float(last_match(LPSOLVE_TIMING_RE, output))
     if exit_code != 0:
         return "ERROR", None, None, solver_seconds
-
     objective = last_match(LPSOLVE_OBJECTIVE_RE, output)
     objective_value = parse_float(objective)
     normalized = output.lower()
@@ -1388,7 +969,6 @@ def parse_lpsolve_output(
         status = "OPTIMAL"
     else:
         status = "UNKNOWN"
-
     if status not in {"OPTIMAL", "FEASIBLE"} or objective_value is None:
         return status, None, None, solver_seconds
     return status, objective, objective_value, solver_seconds
@@ -1406,154 +986,141 @@ def parse_solver_output(
     return "ERROR", None, None, None
 
 
-def result_from_raw(
-    active: ActiveJob,
-    raw: RawExecution,
-    finished_at: float,
-) -> JobResult:
+def result_from_raw(active: ActiveJob, raw: RawExecution, finished_at: float) -> JobResult:
     job = active.prepared.job
-    duration = max(0.0, finished_at - active.started_at)
     if raw.backend_error:
-        status, objective, objective_value, solver_seconds = "ERROR", None, None, None
+        status, objective, solver_seconds = "ERROR", None, None
         append_stderr(active.prepared, f"Ошибка Docker backend: {raw.backend_error}")
-    elif raw.cancel_reason.startswith("timeout"):
-        status, objective, objective_value, solver_seconds = "TIMEOUT", None, None, None
+    elif raw.cancel_reason == "timeout":
+        status, objective, solver_seconds = "TIMEOUT", None, None
     elif raw.cancel_reason:
-        status, objective, objective_value, solver_seconds = "CANCELLED", None, None, None
+        status, objective, solver_seconds = "CANCELLED", None, None
     elif raw.exit_code is None:
-        status, objective, objective_value, solver_seconds = "ERROR", None, None, None
+        status, objective, solver_seconds = "ERROR", None, None
     else:
-        status, objective, objective_value, solver_seconds = parse_solver_output(
+        status, objective, _objective_value, solver_seconds = parse_solver_output(
             job.solver,
             read_log(active.prepared.stdout_path),
             read_log(active.prepared.stderr_path),
             raw.exit_code,
         )
     return JobResult(
-        input_index=job.input_index,
-        problem_id=job.problem_id,
-        job_id=job.job_id,
-        container_id=active.container.container_id,
-        container_name=active.container.container_name,
-        solver=job.solver,
-        order=job.order.text(),
-        timeout_seconds=job.timeout_seconds,
-        status=status,
-        objective=objective,
-        objective_value=objective_value,
-        solver_seconds=solver_seconds,
-        container_seconds=duration,
-        exit_code=raw.exit_code,
-        cancel_reason=(
-            raw.cancel_reason
-            if not raw.backend_error
-            else "; ".join(part for part in (raw.cancel_reason, raw.backend_error) if part)
+        job.input_index,
+        job.job_id,
+        active.container.name,
+        job.solver,
+        job.timeout_seconds,
+        status,
+        objective,
+        solver_seconds,
+        max(0.0, finished_at - active.started_at),
+        raw.exit_code,
+        raw.cancel_reason if not raw.backend_error else "; ".join(
+            part for part in (raw.cancel_reason, raw.backend_error) if part
         ),
     )
 
 
 def synthetic_result(job: PreparedJob, status: str, reason: str) -> JobResult:
     return JobResult(
-        input_index=job.job.input_index,
-        problem_id=job.job.problem_id,
-        job_id=job.job.job_id,
-        container_id="",
-        container_name="",
-        solver=job.job.solver,
-        order=job.job.order.text(),
-        timeout_seconds=job.job.timeout_seconds,
-        status=status,
-        objective=None,
-        objective_value=None,
-        solver_seconds=None,
-        container_seconds=0.0,
-        exit_code=None,
-        cancel_reason=reason,
+        job.job.input_index,
+        job.job.job_id,
+        "",
+        job.job.solver,
+        job.job.timeout_seconds,
+        status,
+        None,
+        None,
+        0.0,
+        None,
+        reason,
     )
 
 
 def error_result(container: ContainerSpec, job: PreparedJob, message: str) -> JobResult:
     append_stderr(job, message)
-    base = synthetic_result(job, "ERROR", "start_error")
-    return JobResult(
-        **{
-            **asdict(base),
-            "container_id": container.container_id,
-            "container_name": container.container_name,
-        }
-    )
+    return replace(synthetic_result(job, "ERROR", "start_error"), container_name=container.name)
 
 
-def write_job_result(output_dir: Path, result: JobResult) -> None:
-    path = output_dir / "jobs" / result.job_id / "result.json"
-    payload = asdict(result)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def format_optional(value: object | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def write_results(output_dir: Path, results: Sequence[JobResult]) -> None:
+    with (output_dir / "jobs.tsv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+        writer.writerow(
+            [
+                "job_id",
+                "container_name",
+                "solver",
+                "timeout_seconds",
+                "status",
+                "objective",
+                "solver_seconds",
+                "container_seconds",
+                "exit_code",
+                "cancel_reason",
+                "selected",
+            ]
+        )
+        for result in sorted(results, key=lambda item: item.input_index):
+            writer.writerow(
+                [
+                    result.job_id,
+                    result.container_name,
+                    result.solver,
+                    format_optional(result.timeout_seconds),
+                    result.status,
+                    format_optional(result.objective),
+                    format_optional(result.solver_seconds),
+                    format_optional(result.container_seconds),
+                    format_optional(result.exit_code),
+                    result.cancel_reason,
+                    "true" if result.selected else "false",
+                ]
+            )
 
 
 def schedule(
     config: RunConfig,
     prepared: tuple[PreparedJob, ...],
-    backend: RunnerBackend,
-    *,
-    clock: Callable[[], float] = time.monotonic,
-    sleeper: Callable[[float], None] = time.sleep,
+    backend: DockerBackend,
     poll_interval: float = 0.05,
-) -> ScheduleOutcome:
+) -> RunOutcome:
     pending = list(prepared)
     active: dict[str, ActiveJob] = {}
-    disabled_containers: set[str] = set()
+    disabled: set[str] = set()
     results: dict[int, JobResult] = {}
-    winners: dict[str, JobResult] = {}
+    selected_job_id: str | None = None
     interrupted = False
 
     def record(result: JobResult) -> None:
         results[result.input_index] = result
-        write_job_result(config.output_dir, result)
+        write_results(config.output_dir, tuple(results.values()))
 
-    def cancel_queued(problem_id: str) -> None:
-        kept: list[PreparedJob] = []
-        for queued in pending:
-            if queued.job.problem_id == problem_id:
-                record(synthetic_result(queued, "CANCELLED", "portfolio_winner"))
-            else:
-                kept.append(queued)
-        pending[:] = kept
-
-    def cancel_running(problem_id: str, winner_job_id: str) -> None:
-        for container_id, item in list(active.items()):
-            if item.prepared.job.problem_id != problem_id:
-                continue
-            if item.prepared.job.job_id == winner_job_id:
-                continue
+    def cancel_remaining(reason: str) -> None:
+        for job in pending:
+            record(synthetic_result(job, "CANCELLED", reason))
+        pending.clear()
+        for container_name, item in list(active.items()):
             try:
-                raw = backend.cancel(item.handle, "portfolio_winner")
+                raw = backend.cancel(item.handle, reason)
             except BackendError as error:
-                append_stderr(item.prepared, str(error))
-                raw = RawExecution(None, "portfolio_winner", str(error), False)
-            del active[container_id]
-            record(result_from_raw(item, raw, clock()))
+                raw = RawExecution(None, reason, str(error), False)
+            del active[container_name]
+            record(result_from_raw(item, raw, time.monotonic()))
             if not raw.reusable_container:
-                disabled_containers.add(container_id)
-
-    def accept_completed_result(result: JobResult) -> None:
-        record(result)
-        if (
-            config.mode == "portfolio"
-            and result.status in WINNING_STATUSES
-            and result.problem_id not in winners
-        ):
-            winners[result.problem_id] = result
-            cancel_queued(result.problem_id)
-            cancel_running(result.problem_id, result.job_id)
+                disabled.add(container_name)
 
     try:
         while pending or active:
             for container in config.containers:
-                if (
-                    container.container_id in active
-                    or container.container_id in disabled_containers
-                    or not pending
-                ):
+                if container.name in active or container.name in disabled:
                     continue
                 job_index = next(
                     (
@@ -1566,10 +1133,7 @@ def schedule(
                 if job_index is None:
                     continue
                 job = pending.pop(job_index)
-                if config.mode == "portfolio" and job.job.problem_id in winners:
-                    record(synthetic_result(job, "CANCELLED", "portfolio_winner"))
-                    continue
-                started_at = clock()
+                started_at = time.monotonic()
                 try:
                     handle = backend.start(container, job)
                 except KeyboardInterrupt:
@@ -1577,349 +1141,119 @@ def schedule(
                     raise
                 except BackendError as error:
                     record(error_result(container, job, str(error)))
-                    disabled_containers.add(container.container_id)
+                    disabled.add(container.name)
                     continue
-                active[container.container_id] = ActiveJob(
-                    container, job, handle, started_at
-                )
+                active[container.name] = ActiveJob(container, job, handle, started_at)
 
             made_progress = False
-            for container_id, item in list(active.items()):
-                # A winner handled earlier in this snapshot may already have
-                # cancelled and removed this sibling.
-                if active.get(container_id) is not item:
-                    continue
-                exit_code = backend.poll(item.handle)
-                if exit_code is None:
+            selected_now = False
+            for container_name, item in list(active.items()):
+                if backend.poll(item.handle) is None:
                     continue
                 raw = backend.complete(item.handle)
-                del active[container_id]
-                result = result_from_raw(item, raw, clock())
-                accept_completed_result(result)
+                del active[container_name]
+                result = result_from_raw(item, raw, time.monotonic())
+                if not config.wait_all and result.status in PROVEN_STATUSES:
+                    result = replace(result, selected=True)
+                    selected_job_id = result.job_id
+                    record(result)
+                    cancel_remaining("first_result")
+                    selected_now = True
+                    made_progress = True
+                    break
+                record(result)
                 made_progress = True
+            if selected_now:
+                continue
 
-            now = clock()
-            for container_id, item in list(active.items()):
-                if active.get(container_id) is not item:
-                    continue
+            now = time.monotonic()
+            for container_name, item in list(active.items()):
                 if now - item.started_at < item.prepared.job.timeout_seconds:
                     continue
                 try:
                     raw = backend.cancel(item.handle, "timeout")
                 except BackendError as error:
-                    append_stderr(item.prepared, str(error))
                     raw = RawExecution(None, "timeout", str(error), False)
-                del active[container_id]
-                accept_completed_result(result_from_raw(item, raw, clock()))
+                del active[container_name]
+                record(result_from_raw(item, raw, time.monotonic()))
                 if not raw.reusable_container:
-                    disabled_containers.add(container_id)
+                    disabled.add(container_name)
                 made_progress = True
 
             available_solvers = {
-                container.solver
-                for container in config.containers
-                if container.container_id not in disabled_containers
+                item.solver for item in config.containers if item.name not in disabled
             }
-            unavailable = [
-                job for job in pending if job.job.solver not in available_solvers
-            ]
+            unavailable = [job for job in pending if job.job.solver not in available_solvers]
             if unavailable:
-                unavailable_ids = {job.job.input_index for job in unavailable}
+                unavailable_indexes = {job.job.input_index for job in unavailable}
                 pending[:] = [
-                    job for job in pending if job.job.input_index not in unavailable_ids
+                    job for job in pending if job.job.input_index not in unavailable_indexes
                 ]
                 for job in unavailable:
-                    append_stderr(
-                        job,
-                        f"Нет доступных контейнеров для solver {job.job.solver!r}",
-                    )
+                    append_stderr(job, f"Нет доступных контейнеров для solver {job.job.solver!r}")
                     record(synthetic_result(job, "ERROR", "no_available_container"))
                 made_progress = True
 
             if active and not made_progress:
-                sleeper(poll_interval)
+                time.sleep(poll_interval)
     except KeyboardInterrupt:
         interrupted = True
-        for container_id, item in list(active.items()):
-            try:
-                raw = backend.cancel(item.handle, "interrupt")
-            except BackendError as error:
-                append_stderr(item.prepared, str(error))
-                raw = RawExecution(None, "interrupt", str(error), False)
-            del active[container_id]
-            record(result_from_raw(item, raw, clock()))
-        for job in pending:
-            record(synthetic_result(job, "CANCELLED", "interrupt"))
-        pending.clear()
+        cancel_remaining("interrupt")
 
-    ordered = tuple(results[index] for index in sorted(results))
-    return ScheduleOutcome(ordered, winners, interrupted)
+    return RunOutcome(
+        tuple(results[index] for index in sorted(results)),
+        selected_job_id,
+        interrupted,
+    )
 
 
-def objective_conflicts(left: JobResult, right: JobResult) -> bool:
-    if left.objective_value is not None and right.objective_value is not None:
-        return not math.isclose(
-            left.objective_value,
-            right.objective_value,
-            rel_tol=1e-7,
-            abs_tol=1e-9,
-        )
-    return left.objective != right.objective
-
-
-def find_conflicts(results: Sequence[JobResult]) -> tuple[Conflict, ...]:
-    grouped: dict[str, list[JobResult]] = {}
-    for result in results:
-        if result.status in WINNING_STATUSES:
-            grouped.setdefault(result.problem_id, []).append(result)
-    conflicts: list[Conflict] = []
-    for problem_id, proven in grouped.items():
-        statuses = sorted({result.status for result in proven})
-        if len(statuses) > 1:
-            conflicts.append(Conflict(problem_id, "status", ", ".join(statuses)))
-            continue
-        if statuses == ["OPTIMAL"]:
-            reference = proven[0]
-            disagreeing = [
-                result
-                for result in proven[1:]
-                if objective_conflicts(reference, result)
-            ]
-            if disagreeing:
-                conflicts.append(
-                    Conflict(
-                        problem_id,
-                        "objective",
-                        f"{reference.job_id}={reference.objective!r}; "
-                        + ", ".join(
-                            f"{result.job_id}={result.objective!r}"
-                            for result in disagreeing
-                        ),
-                    )
-                )
-    return tuple(conflicts)
-
-
-def format_optional(value: object | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float):
-        return f"{value:.6f}"
-    return str(value)
-
-
-def write_reports(
-    config: RunConfig,
-    outcome: ScheduleOutcome,
-    conflicts: tuple[Conflict, ...],
-    setup_error: str = "",
-) -> None:
-    jobs_path = config.output_dir / "jobs.tsv"
-    with jobs_path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
-        writer.writerow(
-            [
-                "problem_id",
-                "job_id",
-                "container_id",
-                "container_name",
-                "solver",
-                "order",
-                "timeout_seconds",
-                "status",
-                "objective",
-                "solver_seconds",
-                "container_seconds",
-                "exit_code",
-                "cancel_reason",
-            ]
-        )
-        for result in outcome.results:
-            writer.writerow(
-                [
-                    result.problem_id,
-                    result.job_id,
-                    result.container_id,
-                    result.container_name,
-                    result.solver,
-                    result.order,
-                    format_optional(result.timeout_seconds),
-                    result.status,
-                    format_optional(result.objective),
-                    format_optional(result.solver_seconds),
-                    format_optional(result.container_seconds),
-                    format_optional(result.exit_code),
-                    result.cancel_reason,
-                ]
-            )
-
-    with (config.output_dir / "winners.tsv").open(
-        "w", encoding="utf-8", newline=""
-    ) as stream:
-        writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
-        writer.writerow(["problem_id", "job_id", "container_id", "status", "objective"])
-        for problem_id in sorted(outcome.winners):
-            winner = outcome.winners[problem_id]
-            writer.writerow(
-                [
-                    problem_id,
-                    winner.job_id,
-                    winner.container_id,
-                    winner.status,
-                    format_optional(winner.objective),
-                ]
-            )
-
-    with (config.output_dir / "conflicts.tsv").open(
-        "w", encoding="utf-8", newline=""
-    ) as stream:
-        writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
-        writer.writerow(["problem_id", "kind", "details"])
-        for conflict in conflicts:
-            writer.writerow([conflict.problem_id, conflict.kind, conflict.details])
-
-    counts = Counter(result.status for result in outcome.results)
-    lines = [
-        "# Результаты",
-        "",
-        f"- Режим: `{config.mode}`",
-        f"- Заданий в манифесте: {len(config.jobs)}",
-        f"- Контейнеров в пуле: {len(config.containers)}",
-        f"- Результатов: {len(outcome.results)}",
-    ]
-    if setup_error:
-        lines.append(f"- Ошибка подготовки: {setup_error}")
-    if outcome.interrupted:
-        lines.append("- Запуск прерван пользователем; активные и ожидавшие job отменены.")
-    lines.extend(["", "## Статусы", ""])
-    if counts:
-        lines.extend(f"- `{status}`: {counts[status]}" for status in sorted(counts))
-    else:
-        lines.append("- Результатов нет.")
-    lines.extend(["", "## Победители portfolio", ""])
-    if outcome.winners:
-        lines.extend(
-            f"- `{problem_id}`: `{winner.job_id}` — {winner.status}"
-            for problem_id, winner in sorted(outcome.winners.items())
-        )
-    else:
-        lines.append("- Нет.")
-    lines.extend(["", "## Конфликты benchmark", ""])
-    if conflicts:
-        lines.extend(
-            f"- `{item.problem_id}`: {item.kind} — {item.details}" for item in conflicts
-        )
-    else:
-        lines.append("- Не обнаружены.")
-    (config.output_dir / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def write_setup_failure(
-    config: RunConfig, prepared: tuple[PreparedJob, ...], message: str
-) -> None:
+def setup_failure(prepared: tuple[PreparedJob, ...], output_dir: Path, message: str) -> None:
     results: list[JobResult] = []
     for job in prepared:
         append_stderr(job, message)
-        result = synthetic_result(job, "ERROR", "setup_error")
-        write_job_result(config.output_dir, result)
-        results.append(result)
-    write_reports(
-        config,
-        ScheduleOutcome(tuple(results), {}, False),
-        (),
-        setup_error=message,
-    )
-    (config.output_dir / "setup-error.txt").write_text(message.rstrip() + "\n", encoding="utf-8")
-
-
-def probe_all_containers(config: RunConfig, backend: RunnerBackend) -> None:
-    runtime_ids: set[str] = set()
-    for container in config.containers:
-        try:
-            probe = backend.probe(container)
-        except BackendError as error:
-            target = config.output_dir / "containers" / container.container_id
-            target.mkdir(exist_ok=True)
-            (target / "error.txt").write_text(str(error) + "\n", encoding="utf-8")
-            raise
-        if probe.runtime_id in runtime_ids:
-            raise BackendError(
-                f"несколько строк containers.tsv указывают на один контейнер {probe.runtime_id}"
-            )
-        runtime_ids.add(probe.runtime_id)
-        write_probe(config.output_dir, container, probe)
-
-
-def finish_execution(
-    config: RunConfig,
-    prepared: tuple[PreparedJob, ...],
-    backend: RunnerBackend,
-) -> int:
-    try:
-        probe_all_containers(config, backend)
-    except BackendError as error:
-        write_setup_failure(config, prepared, str(error))
-        print(f"Ошибка Docker backend: {error}", file=sys.stderr)
-        return EXIT_RUNTIME_ERROR
-    except KeyboardInterrupt:
-        message = "Проверка контейнеров прервана пользователем"
-        write_setup_failure(config, prepared, message)
-        print(message, file=sys.stderr)
-        return EXIT_INTERRUPTED
-
-    outcome = schedule(config, prepared, backend)
-    conflicts = find_conflicts(outcome.results) if config.mode == "benchmark" else ()
-    write_reports(config, outcome, conflicts)
-    if outcome.interrupted:
-        print("Запуск прерван; отчёты сохранены", file=sys.stderr)
-        return EXIT_INTERRUPTED
-    if conflicts:
-        print("Обнаружен конфликт доказанных результатов", file=sys.stderr)
-        return EXIT_CONFLICT
-    if any(result.status == "ERROR" for result in outcome.results):
-        print("Один или несколько job завершились с ERROR", file=sys.stderr)
-        return EXIT_RUNTIME_ERROR
-    print(
-        f"Запуск завершён: режим={config.mode}, job={len(outcome.results)}, "
-        f"output={config.output_dir}"
-    )
-    return EXIT_OK
-
-
-def execute(config: RunConfig, backend: RunnerBackend) -> int:
-    content = prepare_all_content(config.jobs)
-    prepared = create_output(config, content)
-    return finish_execution(config, prepared, backend)
+        results.append(synthetic_result(job, "ERROR", "setup_error"))
+    write_results(output_dir, results)
 
 
 def run(arguments: Sequence[str] | None = None) -> int:
     try:
         parsed = build_parser().parse_args(arguments)
         config = load_config(parsed)
-        content = prepare_all_content(config.jobs)
-    except InputError as error:
-        print(f"Ошибка входных данных: {error}", file=sys.stderr)
-        return EXIT_INPUT_ERROR
-
-    try:
+        content = prepare_content(config.jobs)
         prepared = create_output(config, content)
     except InputError as error:
         print(f"Ошибка входных данных: {error}", file=sys.stderr)
         return EXIT_INPUT_ERROR
 
     try:
-        docker = find_docker()
+        backend = DockerBackend(find_docker())
+        probe_all_containers(config, backend)
     except BackendError as error:
-        write_setup_failure(config, prepared, str(error))
-        print(f"Ошибка Docker backend: {error}", file=sys.stderr)
+        setup_failure(prepared, config.output_dir, str(error))
+        print(f"Ошибка Docker: {error}", file=sys.stderr)
         return EXIT_RUNTIME_ERROR
     except KeyboardInterrupt:
-        message = "Проверка Docker прервана пользователем"
-        write_setup_failure(config, prepared, message)
+        message = "Проверка Docker прервана"
+        setup_failure(prepared, config.output_dir, message)
         print(message, file=sys.stderr)
         return EXIT_INTERRUPTED
 
-    return finish_execution(config, prepared, DockerBackend(docker))
+    outcome = schedule(config, prepared, backend)
+    write_results(config.output_dir, outcome.results)
+    if outcome.interrupted:
+        print(f"Запуск прерван; output={config.output_dir}", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    if any(result.status == "ERROR" for result in outcome.results):
+        print(f"Ошибка выполнения; output={config.output_dir}", file=sys.stderr)
+        return EXIT_RUNTIME_ERROR
+    if config.wait_all:
+        print(f"Запуск завершён: job={len(outcome.results)}, output={config.output_dir}")
+    else:
+        print(
+            f"Запуск завершён: selected={outcome.selected_job_id or 'none'}, "
+            f"job={len(outcome.results)}, output={config.output_dir}"
+        )
+    return EXIT_OK
 
 
 if __name__ == "__main__":
