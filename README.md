@@ -1,45 +1,48 @@
-# Parallel HiGHS runner
+# Parallel solver runner
 
-`parallel_runner.py` выполняет независимые задачи HiGHS в пуле **уже
-запущенных** Docker-контейнеров. Контейнеры взаимозаменяемы: runner назначает
-каждый job ровно одному свободному контейнеру и никогда не запускает в одном
-контейнере более одного своего job одновременно.
+`parallel_runner.py` запускает задачи HiGHS, SCIP, FSCIP и lp_solve в пуле
+уже работающих Docker-контейнеров. Каждая job попадает только в контейнер
+с тем же `solver`; в одном контейнере одновременно выполняется не более
+одной job.
 
 Runner не создаёт, не останавливает и не удаляет пользовательские контейнеры.
-Для каждого запуска он копирует модель и options в собственный случайно
-именованный каталог `/tmp/lp-parallel-runner-...` внутри выбранного контейнера,
-а после завершения удаляет только этот каталог.
+Для каждого запуска он создаёт свой каталог `/tmp/lp-parallel-runner-...` внутри
+выбранного контейнера и удаляет только этот каталог.
 
 ## Требования
 
-- Python 3.10 или новее, дополнительных Python-пакетов нет;
+- Python 3.10 или новее; дополнительные Python-пакеты не нужны;
 - Docker CLI с доступом к daemon;
-- один или несколько уже запущенных контейнеров с POSIX `sh` и `highs` в
-  `PATH`.
+- заранее запущенные контейнеры с POSIX `sh` и нужным solver в `PATH`.
 
-Сейчас поддерживается только HiGHS. Проверка всех контейнеров выполняется до
-старта первого job. Остановленный контейнер, отсутствие `sh`/`highs`, повторная
-ссылка на один runtime-контейнер или неизвестный solver приводят к понятной
-ошибке.
+До первой job runner проверяет Docker, каждый контейнер, доступность solver и
+его версию. Для FSCIP дополнительно проверяется доступное контейнеру число CPU.
 
-## Подготовка контейнеров
+## Образы и контейнеры
 
-Образ из репозитория можно собрать так:
+В репозитории есть три Dockerfile:
 
-```bash
-docker build -t lp-highs .
-```
+- `Dockerfile.highs` — HiGHS 1.15.1;
+- `Dockerfile.scip` — SCIP Optimization Suite 10.1.0 с бинарниками `scip` и `fscip`;
+- `Dockerfile.lp_solve` — lp_solve 5.5.2.14.
 
-Контейнер должен оставаться запущенным, поэтому для данного образа нужно
-переопределить entrypoint:
+Сборка:
 
 ```bash
-docker run -d --name highs-a --network none --entrypoint sleep lp-highs infinity
-docker run -d --name highs-b --network none --entrypoint sleep lp-highs infinity
+docker build -f Dockerfile.highs -t lp-highs:1.15.1 .
+docker build -f Dockerfile.scip -t lp-scip:10.1.0 .
+docker build -f Dockerfile.lp_solve -t lp-lp-solve:5.5.2.14 .
 ```
 
-Эти команды — только пример ручной подготовки. Сам runner `docker run`,
-`docker stop` и `docker rm` не вызывает.
+SCIP и FSCIP используют один образ, но разные контейнеры. Контейнер FSCIP должен
+получить не меньше CPU, чем указано в `threads`:
+
+```bash
+docker run -d --name highs-a --network none --entrypoint sleep lp-highs:1.15.1 infinity
+docker run -d --name scip-a --network none --entrypoint sleep lp-scip:10.1.0 infinity
+docker run -d --name fscip-4t --cpus 4 --network none --entrypoint sleep lp-scip:10.1.0 infinity
+docker run -d --name lp-solve-a --network none --entrypoint sleep lp-lp-solve:5.5.2.14 infinity
+```
 
 ## Манифесты
 
@@ -48,53 +51,54 @@ docker run -d --name highs-b --network none --entrypoint sleep lp-highs infinity
 `containers.tsv`:
 
 ```text
-id	container_name
-worker-a	highs-a
-worker-b	highs-b
+id	container_name	solver	threads
+highs-a	highs-a	highs	1
+scip-a	scip-a	scip	1
+fscip-4t	fscip-4t	fscip	4
+lp-solve-a	lp-solve-a	lp_solve	1
 ```
 
-- `id` — уникальный идентификатор worker в отчётах;
-- `container_name` — уникальное имя уже запущенного контейнера.
-
-Идентификаторы `id`, `problem_id` и `job_id` должны начинаться с буквы или
-цифры и содержать только ASCII-буквы, цифры, `.`, `_`, `-` (до 128 символов).
+`threads` должен быть равен `1` для HiGHS, SCIP и lp_solve. Для FSCIP требуется
+не меньше `2`; runner передаёт это значение через `fscip -sth`.
 
 `jobs.tsv`:
 
 ```text
-problem_id	job_id	model	options	order	timeout_seconds
-p01	p01-default	models/p01.lp	options/default.options	original	300
-p01	p01-shuffled	models/p01.lp	options/alt.options	shuffle:42	300
-p02	p02-low-arity	models/p02.mps	options/default.options	low-arity-first	120.5
+problem_id	job_id	solver	model	options	order	timeout_seconds
+afiro	afiro-highs	highs	models/afiro.mps	options/highs.options	original	300
+afiro	afiro-scip	scip	models/afiro.mps	options/scip.set	original	300
+afiro	afiro-fscip	fscip	models/afiro.mps	options/fscip.prm	original	300
+afiro	afiro-lp-solve	lp_solve	models/afiro.mps	options/lp_solve.ini	original	300
 ```
 
-Пути `model` и `options` разрешаются относительно каталога `jobs.tsv`.
-`problem_id` группирует альтернативные job одной математической задачи;
-`job_id` уникален во всём манифесте. `timeout_seconds` — конечное положительное
-число.
+Пути `model` и `options` разрешаются относительно каталога `jobs.tsv`. `problem_id`
+группирует альтернативные job одной задачи; `job_id` уникален во всём файле.
+
+Поддерживаемые форматы:
+
+| `solver` | Модель | Настройки |
+| --- | --- | --- |
+| `highs` | `.lp`, `.mps` | `.options` |
+| `scip` | `.lp`, `.mps` | `.set` |
+| `fscip` | `.lp`, `.mps` | `.prm` |
+| `lp_solve` | только `.mps` | `.ini` |
+
+Для HiGHS runner принудительно задаёт `output_flag=true`, `log_to_console=true`,
+`threads=1` и `parallel=off`. Для SCIP и внутренних SCIP-процессов FSCIP он задаёт
+`lp/threads = 1`. Пользовательский `.prm` FSCIP содержит только параметры UG.
 
 Допустимые значения `order`:
 
-- `original` — исходный файл копируется побайтно;
+- `original` — исходный файл копируется без изменений;
 - `shuffle:<uint64>` — воспроизводимая перестановка ограничений;
-- `low-arity-first` — стабильная сортировка по числу разных переменных в
-  ограничении.
+- `low-arity-first` — стабильная сортировка по числу разных переменных.
 
-Для LP переставляются целиком именованные, в том числе многострочные, блоки из
-`Subject To`. Для MPS переставляются полные именованные записи ограничений в
-`ROWS`, а арность вычисляется по `COLUMNS`. Коэффициенты, правая часть, bounds и
-остальные секции не меняются. Неоднозначные или безымянные ограничения
-отклоняются вместо потенциального изменения математики.
-
-В effective options runner принудительно задаёт `output_flag=true`,
-`log_to_console=true`, `threads=1` и `parallel=off`, заменяя одноимённые строки
-из исходного options-файла.
+Для LP переставляются именованные блоки из `Subject To`; для MPS — записи из `ROWS`.
+Неоднозначные или безымянные ограничения отклоняются.
 
 ## Запуск
 
-По умолчанию runner работает как portfolio. Флаг `--wait-all` возвращает
-поведение полного ожидания и выполняет все job независимо от результатов
-соседей:
+Флаг `--wait-all` выполняет все job и эквивалентен `--mode benchmark`:
 
 ```bash
 python3 parallel_runner.py \
@@ -104,8 +108,8 @@ python3 parallel_runner.py \
   --output results-benchmark
 ```
 
-Без `--wait-all` portfolio выбирает первого доказанного победителя отдельно для
-каждого `problem_id`:
+Без `--wait-all` runner работает как portfolio и выбирает первую доказанную job для каждого
+`problem_id`:
 
 ```bash
 python3 parallel_runner.py \
@@ -114,66 +118,45 @@ python3 parallel_runner.py \
   --output results-portfolio
 ```
 
-Для явного выбора также сохранён `--mode benchmark|portfolio`. `--mode` и
-`--wait-all` взаимоисключающие; `--wait-all` эквивалентен
-`--mode benchmark`.
+То же самое можно задать явно через `--mode benchmark|portfolio`. `--mode` и `--wait-all`
+взаимоисключающие.
 
-Победные статусы: `OPTIMAL`, `INFEASIBLE`, `UNBOUNDED`. Статусы
-`UNBOUNDED_OR_INFEASIBLE`, `FEASIBLE`, `TIMEOUT`, `UNKNOWN` и `ERROR` не
-останавливают sibling-job. После победы ожидающие sibling-job помечаются
-`CANCELLED`, а активным процессам отправляются `TERM`, затем после grace period
-`KILL`; job других `problem_id` продолжаются. Та же адресная отмена используется
-при timeout и `Ctrl-C`.
+Победные статусы: `OPTIMAL`, `INFEASIBLE`, `UNBOUNDED`. После победы ожидающие job того же
+`problem_id` помечаются `CANCELLED`, а активные останавливаются. Job других `problem_id`
+продолжают работать.
 
-Output должен быть новым каталогом: существующий файл, каталог или symlink
-никогда не перезаписывается.
+Каталог `--output` должен быть новым: существующий файл, каталог или symlink не
+перезаписывается.
 
 ## Результаты
 
-Runner сохраняет:
+Runner сохраняет копии манифестов, `docker inspect`, версию solver, подготовленные
+модели и настройки, stdout/stderr и `result.json` каждой job. Общие файлы:
 
 ```text
 output/
   inputs/containers.tsv
   inputs/jobs.tsv
   containers/<id>/inspect.json
-  containers/<id>/highs-version.txt
-  jobs/<job_id>/model.lp|mps
-  jobs/<job_id>/effective.options
-  jobs/<job_id>/stdout.log
-  jobs/<job_id>/stderr.log
-  jobs/<job_id>/result.json
+  containers/<id>/solver-version.txt
+  jobs/<job_id>/...
   jobs.tsv
   winners.tsv
   conflicts.tsv
   RESULTS.md
 ```
 
-`jobs.tsv` содержит статус, objective, solver/container time, exit code,
-контейнер и причину отмены каждого job. `winners.tsv` заполняется в portfolio.
-В benchmark `conflicts.tsv` и `RESULTS.md` показывают несовместимые доказанные
-статусы или objective внутри одного `problem_id`.
+`jobs.tsv` содержит solver, статус, objective, время solver и контейнера, exit code и
+причину отмены. В benchmark `conflicts.tsv` и `RESULTS.md` показывают несовпадения статусов
+или objective внутри одного `problem_id`.
 
 Коды завершения:
 
-- `0` — запуск завершён без runtime-ошибок и конфликтов;
-- `2` — Docker/backend или хотя бы один job завершился с `ERROR`;
+- `0` — нет runtime-ошибок и конфликтов;
+- `2` — ошибка Docker/backend или хотя бы одна job завершилась с `ERROR`;
 - `3` — конфликт результатов benchmark;
 - `64` — ошибка CLI, манифеста или входного файла;
-- `130` — прерывание пользователем, после адресной отмены и записи отчётов.
+- `130` — запуск прерван пользователем.
 
-`TIMEOUT`, отсутствие доказанного победителя portfolio и прочие корректно
-зафиксированные недоказанные статусы сами по себе не являются ошибкой runner.
-
-## Тесты
-
-Все автоматические тесты работают через fake backend и не требуют Docker:
-
-```bash
-python3 -m unittest discover -s tests -v
-python3 -m py_compile parallel_runner.py tests/*.py
-```
-
-Они покрывают manifests, scheduler, ограничение параллелизма, benchmark,
-portfolio по `problem_id`, timeout, interrupt, отмену queued/running job,
-конфликты, LP/MPS permutation и отказ от перезаписи output.
+`TIMEOUT`, отсутствие победителя portfolio и другие корректно зафиксированные
+недоказанные статусы сами по себе не считаются ошибкой runner.
